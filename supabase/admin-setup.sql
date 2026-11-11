@@ -28,10 +28,13 @@ create table if not exists public.nextvo_admin_product_details (
   supplier_product_url text not null default '',
   supplier_price numeric(12,2) check (supplier_price is null or supplier_price >= 0),
   supplier_currency text not null default 'NGN',
+  source_image_urls jsonb not null default '[]'::jsonb check (jsonb_typeof(source_image_urls) = 'array'),
   status text not null default 'draft' check (status in ('draft','published','unpublished','unavailable')),
   updated_by uuid references auth.users(id) on delete set null,
   updated_at timestamptz not null default now()
 );
+alter table public.nextvo_admin_product_details
+  add column if not exists source_image_urls jsonb not null default '[]'::jsonb;
 
 create table if not exists public.nextvo_inventory_history (
   id uuid primary key default gen_random_uuid(),
@@ -57,6 +60,49 @@ create table if not exists public.nextvo_import_history (
   created_at timestamptz not null default now()
 );
 create index if not exists nextvo_import_history_created_idx on public.nextvo_import_history(created_at desc);
+
+-- Per-admin database-backed throttling for metadata and image imports. This is enforced
+-- atomically across app instances and is required before the importer endpoints are enabled.
+create table if not exists public.nextvo_import_rate_limits (
+  admin_id uuid primary key references auth.users(id) on delete cascade,
+  window_started_at timestamptz not null,
+  request_count integer not null check (request_count > 0)
+);
+
+create or replace function public.nextvo_consume_import_rate_limit(p_window_seconds integer, p_max_requests integer)
+returns boolean
+language plpgsql
+security definer
+set search_path = pg_catalog, public
+as $$
+declare
+  v_now timestamptz := clock_timestamp();
+  v_count integer;
+begin
+  if not public.nextvo_is_admin() or auth.uid() is null then
+    raise exception 'Administrator access required' using errcode = '42501';
+  end if;
+  if p_window_seconds is distinct from 60 or p_max_requests is distinct from 10 then
+    raise exception 'Importer rate limit is fixed at 10 requests per minute';
+  end if;
+
+  insert into public.nextvo_import_rate_limits as limits(admin_id, window_started_at, request_count)
+  values (auth.uid(), v_now, 1)
+  on conflict (admin_id) do update set
+    window_started_at = case
+      when limits.window_started_at <= v_now - make_interval(secs => p_window_seconds) then v_now
+      else limits.window_started_at
+    end,
+    request_count = case
+      when limits.window_started_at <= v_now - make_interval(secs => p_window_seconds) then 1
+      else limits.request_count + 1
+    end
+  returning request_count into v_count;
+  return v_count <= p_max_requests;
+end;
+$$;
+revoke all on function public.nextvo_consume_import_rate_limit(integer,integer) from public, anon;
+grant execute on function public.nextvo_consume_import_rate_limit(integer,integer) to authenticated;
 
 create table if not exists public.nextvo_store_settings (
   key text primary key,
@@ -84,22 +130,33 @@ create index if not exists nextvo_verified_payments_verified_idx on public.nextv
 alter table public.nextvo_admin_product_details enable row level security;
 alter table public.nextvo_inventory_history enable row level security;
 alter table public.nextvo_import_history enable row level security;
+alter table public.nextvo_import_rate_limits enable row level security;
 alter table public.nextvo_store_settings enable row level security;
 alter table public.nextvo_verified_payments enable row level security;
 
 grant select, insert, update, delete on public.nextvo_admin_product_details, public.nextvo_inventory_history, public.nextvo_import_history, public.nextvo_store_settings to authenticated;
 revoke all on public.nextvo_verified_payments from anon, authenticated;
 grant select on public.nextvo_verified_payments to authenticated;
-drop policy if exists "nextvo admin reads verified payments" on public.nextvo_verified_payments;
-create policy "nextvo admin reads verified payments" on public.nextvo_verified_payments for select to authenticated using (public.nextvo_is_admin());
-drop policy if exists "nextvo admin manages private product details" on public.nextvo_admin_product_details;
-create policy "nextvo admin manages private product details" on public.nextvo_admin_product_details for all to authenticated using (public.nextvo_is_admin()) with check (public.nextvo_is_admin());
-drop policy if exists "nextvo admin manages stock history" on public.nextvo_inventory_history;
-create policy "nextvo admin manages stock history" on public.nextvo_inventory_history for all to authenticated using (public.nextvo_is_admin()) with check (public.nextvo_is_admin());
-drop policy if exists "nextvo admin manages import history" on public.nextvo_import_history;
-create policy "nextvo admin manages import history" on public.nextvo_import_history for all to authenticated using (public.nextvo_is_admin()) with check (public.nextvo_is_admin());
-drop policy if exists "nextvo admin manages store settings" on public.nextvo_store_settings;
-create policy "nextvo admin manages store settings" on public.nextvo_store_settings for all to authenticated using (public.nextvo_is_admin()) with check (public.nextvo_is_admin());
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='nextvo_verified_payments' AND policyname='nextvo admin reads verified payments') THEN
+    EXECUTE 'CREATE POLICY "nextvo admin reads verified payments" ON public.nextvo_verified_payments FOR SELECT TO authenticated USING (public.nextvo_is_admin())';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='nextvo_admin_product_details' AND policyname='nextvo admin manages private product details') THEN
+    EXECUTE 'CREATE POLICY "nextvo admin manages private product details" ON public.nextvo_admin_product_details FOR ALL TO authenticated USING (public.nextvo_is_admin()) WITH CHECK (public.nextvo_is_admin())';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='nextvo_inventory_history' AND policyname='nextvo admin manages stock history') THEN
+    EXECUTE 'CREATE POLICY "nextvo admin manages stock history" ON public.nextvo_inventory_history FOR ALL TO authenticated USING (public.nextvo_is_admin()) WITH CHECK (public.nextvo_is_admin())';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='nextvo_import_history' AND policyname='nextvo admin manages import history') THEN
+    EXECUTE 'CREATE POLICY "nextvo admin manages import history" ON public.nextvo_import_history FOR ALL TO authenticated USING (public.nextvo_is_admin()) WITH CHECK (public.nextvo_is_admin())';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='nextvo_import_rate_limits' AND policyname='nextvo admin manages importer rate limits') THEN
+    EXECUTE 'CREATE POLICY "nextvo admin manages importer rate limits" ON public.nextvo_import_rate_limits FOR ALL TO authenticated USING (public.nextvo_is_admin()) WITH CHECK (public.nextvo_is_admin())';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='nextvo_store_settings' AND policyname='nextvo admin manages store settings') THEN
+    EXECUTE 'CREATE POLICY "nextvo admin manages store settings" ON public.nextvo_store_settings FOR ALL TO authenticated USING (public.nextvo_is_admin()) WITH CHECK (public.nextvo_is_admin())';
+  END IF;
+END $$;
 
 -- Only authenticated users carrying a trusted app_metadata role can write catalogue data.
 -- Public/anon reads continue to be governed by the storefront's existing active-only policies.
@@ -109,9 +166,23 @@ BEGIN
   FOREACH t IN ARRAY ARRAY['categories','subcategories','products','product_images','product_variants'] LOOP
     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON public.%I TO authenticated', t);
-    EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', 'nextvo admin manages ' || t, t);
-    EXECUTE format('CREATE POLICY %I ON public.%I FOR ALL TO authenticated USING (public.nextvo_is_admin()) WITH CHECK (public.nextvo_is_admin())', 'nextvo admin manages ' || t, t);
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename=t AND policyname='nextvo admin manages ' || t) THEN
+      EXECUTE format('CREATE POLICY %I ON public.%I FOR ALL TO authenticated USING (public.nextvo_is_admin()) WITH CHECK (public.nextvo_is_admin())', 'nextvo admin manages ' || t, t);
+    END IF;
   END LOOP;
+END $$;
+
+-- Keep existing public-read behavior and add a trusted-Admin write path. Review any broader policies first.
+DO $$ BEGIN
+  IF to_regclass('storage.objects') IS NOT NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='storage' AND tablename='objects' AND policyname='nextvo admins upload product images') THEN
+      EXECUTE 'CREATE POLICY "nextvo admins upload product images" ON storage.objects FOR INSERT TO authenticated WITH CHECK (bucket_id = ''product-images'' AND public.nextvo_is_admin())';
+    END IF;
+    -- Deletion only enables cleanup of temporary uploads after a failed atomic catalogue save.
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='storage' AND tablename='objects' AND policyname='nextvo admins delete product images') THEN
+      EXECUTE 'CREATE POLICY "nextvo admins delete product images" ON storage.objects FOR DELETE TO authenticated USING (bucket_id = ''product-images'' AND public.nextvo_is_admin())';
+    END IF;
+  END IF;
 END $$;
 
 -- Give verified admins read-only access to customer records and order items. Order fulfilment
@@ -122,14 +193,18 @@ BEGIN
   FOREACH t IN ARRAY ARRAY['profiles','customer_addresses','orders','order_items'] LOOP
     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('GRANT SELECT ON public.%I TO authenticated', t);
-    EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', 'nextvo admin reads ' || t, t);
-    EXECUTE format('CREATE POLICY %I ON public.%I FOR SELECT TO authenticated USING (public.nextvo_is_admin())', 'nextvo admin reads ' || t, t);
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename=t AND policyname='nextvo admin reads ' || t) THEN
+      EXECUTE format('CREATE POLICY %I ON public.%I FOR SELECT TO authenticated USING (public.nextvo_is_admin())', 'nextvo admin reads ' || t, t);
+    END IF;
   END LOOP;
 END $$;
 REVOKE UPDATE ON public.orders FROM authenticated;
 GRANT UPDATE (status) ON public.orders TO authenticated;
-DROP POLICY IF EXISTS "nextvo admin updates fulfilment status" ON public.orders;
-CREATE POLICY "nextvo admin updates fulfilment status" ON public.orders FOR UPDATE TO authenticated USING (public.nextvo_is_admin()) WITH CHECK (public.nextvo_is_admin());
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='orders' AND policyname='nextvo admin updates fulfilment status') THEN
+    EXECUTE 'CREATE POLICY "nextvo admin updates fulfilment status" ON public.orders FOR UPDATE TO authenticated USING (public.nextvo_is_admin()) WITH CHECK (public.nextvo_is_admin())';
+  END IF;
+END $$;
 
 -- Atomic catalogue save. Internal supplier cost/URL is stored separately from the public products row.
 create or replace function public.nextvo_admin_save_product(
@@ -161,6 +236,7 @@ begin
   if v_category_id is null then raise exception 'Choose a category'; end if;
   if coalesce((p_product ->> 'price_ngn')::numeric, -1) < 0 then raise exception 'Selling price cannot be negative'; end if;
   if v_stock < 0 then raise exception 'Stock cannot be negative'; end if;
+  if jsonb_typeof(coalesce(p_private -> 'source_image_urls','[]'::jsonb)) <> 'array' then raise exception 'Image source metadata must be an array'; end if;
 
   if nullif(p_product ->> 'id','') is null then
     insert into public.products (category_id, subcategory_id, slug, name, description, brand, price_ngn, compare_at_price_ngn, currency_code, image_url, stock_quantity, featured, is_new_arrival, active, attributes, search_terms)
@@ -189,9 +265,9 @@ begin
     values(v_id,coalesce(v_old_stock,0),v_stock-coalesce(v_old_stock,0),v_stock,'Stock changed in product editor',auth.uid());
   end if;
 
-  insert into public.nextvo_admin_product_details(product_id,short_description,supplier_name,supplier_product_url,supplier_price,supplier_currency,status,updated_by,updated_at)
-  values (v_id,coalesce(p_private ->> 'short_description',''),coalesce(p_private ->> 'supplier_name',''),coalesce(p_private ->> 'supplier_product_url',''),nullif(p_private ->> 'supplier_price','')::numeric,coalesce(nullif(p_private ->> 'supplier_currency',''),'NGN'),v_status,auth.uid(),now())
-  on conflict(product_id) do update set short_description=excluded.short_description,supplier_name=excluded.supplier_name,supplier_product_url=excluded.supplier_product_url,supplier_price=excluded.supplier_price,supplier_currency=excluded.supplier_currency,status=excluded.status,updated_by=excluded.updated_by,updated_at=now();
+  insert into public.nextvo_admin_product_details as current_details(product_id,short_description,supplier_name,supplier_product_url,supplier_price,supplier_currency,source_image_urls,status,updated_by,updated_at)
+  values (v_id,coalesce(p_private ->> 'short_description',''),coalesce(p_private ->> 'supplier_name',''),coalesce(p_private ->> 'supplier_product_url',''),nullif(p_private ->> 'supplier_price','')::numeric,coalesce(nullif(p_private ->> 'supplier_currency',''),'NGN'),coalesce(p_private -> 'source_image_urls','[]'::jsonb),v_status,auth.uid(),now())
+  on conflict(product_id) do update set short_description=excluded.short_description,supplier_name=excluded.supplier_name,supplier_product_url=excluded.supplier_product_url,supplier_price=excluded.supplier_price,supplier_currency=excluded.supplier_currency,source_image_urls=coalesce(p_private -> 'source_image_urls',current_details.source_image_urls),status=excluded.status,updated_by=excluded.updated_by,updated_at=now();
 
   delete from public.product_images where product_id = v_id;
   for v_image in select value from jsonb_array_elements(coalesce(p_images,'[]'::jsonb)) loop
@@ -225,6 +301,25 @@ end;
 $$;
 revoke all on function public.nextvo_admin_save_product(jsonb,jsonb,jsonb,jsonb) from public, anon;
 grant execute on function public.nextvo_admin_save_product(jsonb,jsonb,jsonb,jsonb) to authenticated;
+
+create or replace function public.nextvo_admin_set_product_status(p_product_id uuid, p_status text)
+returns void
+language plpgsql
+security invoker
+set search_path = pg_catalog, public
+as $$
+begin
+  if not public.nextvo_is_admin() then raise exception 'Administrator access required' using errcode = '42501'; end if;
+  if p_status is null or p_status not in ('draft','published','unpublished','unavailable') then raise exception 'Invalid publishing state'; end if;
+  update public.products set active = p_status = 'published' where id = p_product_id;
+  if not found then raise exception 'Product not found'; end if;
+  insert into public.nextvo_admin_product_details(product_id,status,updated_by,updated_at)
+  values (p_product_id,p_status,auth.uid(),now())
+  on conflict (product_id) do update set status = excluded.status, updated_by = excluded.updated_by, updated_at = now();
+end;
+$$;
+revoke all on function public.nextvo_admin_set_product_status(uuid,text) from public, anon;
+grant execute on function public.nextvo_admin_set_product_status(uuid,text) to authenticated;
 
 create or replace function public.nextvo_admin_adjust_stock(p_product_id uuid,p_delta integer,p_reason text)
 returns integer
@@ -315,18 +410,6 @@ end;
 $$;
 revoke all on function public.nextvo_admin_customer_count() from public, anon;
 grant execute on function public.nextvo_admin_customer_count() to authenticated;
-
--- Uploads are private-write/admin-only; existing public reads from product-images remain unchanged.
-DO $$ BEGIN
-  IF to_regclass('storage.objects') IS NOT NULL THEN
-    EXECUTE 'DROP POLICY IF EXISTS "nextvo admin uploads product images" ON storage.objects';
-    EXECUTE 'CREATE POLICY "nextvo admin uploads product images" ON storage.objects FOR INSERT TO authenticated WITH CHECK (bucket_id = ''product-images'' AND public.nextvo_is_admin())';
-    EXECUTE 'DROP POLICY IF EXISTS "nextvo admin updates product images" ON storage.objects';
-    EXECUTE 'CREATE POLICY "nextvo admin updates product images" ON storage.objects FOR UPDATE TO authenticated USING (bucket_id = ''product-images'' AND public.nextvo_is_admin()) WITH CHECK (bucket_id = ''product-images'' AND public.nextvo_is_admin())';
-    EXECUTE 'DROP POLICY IF EXISTS "nextvo admin deletes product images" ON storage.objects';
-    EXECUTE 'CREATE POLICY "nextvo admin deletes product images" ON storage.objects FOR DELETE TO authenticated USING (bucket_id = ''product-images'' AND public.nextvo_is_admin())';
-  END IF;
-END $$;
 
 -- Realtime is best-effort: enable for the catalogue tables used by the admin and storefront.
 DO $$

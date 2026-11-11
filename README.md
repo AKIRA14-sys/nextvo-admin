@@ -1,73 +1,104 @@
 # NEXTVO Admin
 
-A standalone, mobile-first web dashboard and installable PWA for managing the NEXTVO catalogue. It is its own Next.js application and GitHub repository; it shares the existing storefront's Supabase project rather than creating a second catalogue.
+A standalone, mobile-first, installable PWA for managing the NEXTVO catalogue. It is a separate Next.js application and repository, connected to the existing storefront Supabase project. It does not create a second catalogue or seed demo data.
 
-## What is in this project
+## What the Admin does
 
-The dashboard includes Supabase Auth login/password recovery, protected admin routes, catalogue search and product editing, image upload/reordering, product variants, publication controls, category/subcategory management, audited stock adjustments, order fulfilment status, a restricted customer directory, product-link metadata import/review, import history, a read-only verified-payment ledger, an estimated-profit calculator, real-data analytics, store settings, account/session controls, and a network-only PWA shell with an offline fallback. It does not seed invented products, customers, orders, prices or revenue.
+The app includes protected catalogue editing, publication controls, category management, product variants, stock adjustments, image upload/reordering, public-page metadata import, customer and order views, an Admin-only verified-payment ledger, estimated-profit tools and private Admin settings. It does not create fictional products, customers, orders, payments, sales or analytics.
 
-Supplier import only fetches public HTTPS page metadata and structured data. It checks DNS addresses and redirects, rejects private/internal targets, pins DNS for the request, and limits redirects, response size and timeout. It does not work around CAPTCHA, login, paywalls or anti-bot controls. Imported copy and images must be reviewed; stock must be verified manually.
+Admin authorization is checked server-side and in Row Level Security using trusted Supabase Auth `app_metadata` claims (`role: "admin"` or `role: "super_admin"`, with the existing legacy equivalents retained). It never uses user-editable `user_metadata` as an authorization boundary. The browser uses only the project's publishable/anon key; no service-role key is used or required.
 
-## Setup in the existing Supabase project
+## Product editing and prices
 
-1. Open the existing NEXTVO Supabase project (`eagalzikryikfibqcpsr`), not a new project.
-2. Review and run [`supabase/admin-setup.sql`](supabase/admin-setup.sql) in the SQL Editor. The SQL adds private supplier details, inventory and import history, protected settings, admin-only catalogue-write policies, a narrow customer-count/list API, status-only order updates, atomic product/stock RPCs, and a read-only verified-payment ledger with revenue RPCs. It also adds catalogue tables to Supabase Realtime when that publication is available. Browser-authenticated users receive no write grant on the payment ledger.
-3. Confirm the existing public `product-images` Storage bucket and its public read path are present. Admin image writes are separately restricted to an authenticated admin.
-4. Ensure the intended administrator already exists in Supabase Auth. Assign `{"role":"super_admin"}` only to that account's trusted **app metadata**. If using the SQL Editor, first obtain that account's Auth user UUID and run this one-time, account-specific statement there:
+The product editor has separate actions: **Save draft** always writes `draft`, **Publish** explicitly writes `published`, and **Save changes** preserves the selected current status. Product prices, compare-at prices and variant prices are stored as NGN. Supplier costs and their original three-letter currency code are stored only in the Admin-only details table. The importer leaves the NGN selling price blank; no currency conversion is performed.
 
-   ```sql
-   update auth.users
-   set raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || '{"role":"super_admin"}'::jsonb
-   where id = 'THE_EXISTING_ADMIN_AUTH_USER_UUID';
-   ```
+The Admin checks for duplicate slugs before saving. The storefront's existing schema migration declares `products.slug` unique, which is the final database guard for normal exact-slug collisions. The current storefront does not keep old slugs as redirects, so changing an already-shared product slug can still break the old link; a storefront-side slug-history/redirect change remains separate and unapproved.
 
-   Do not put this role in user metadata, browser code, a customer profile or local storage. Sign out and sign in again to refresh the role claim. Only `admin` and `super_admin` are accepted in this release; the other planned job roles do not yet have separate permissions.
-5. In Supabase Auth URL settings, allow the deployed Admin origin's `/auth/callback` redirect (and `http://localhost:3000/auth/callback` for local development). Password-recovery redirects are built from the current Admin origin.
+## Importer and images
 
-The SQL file is a setup script, not a report of changes already applied. Review it against the live schema and take the usual database backup before applying production DDL. No Supabase service-role key is needed or used by this app.
+Import supports public page metadata and Product JSON-LD when available; it is not compatible with every supplier site. Extracted price/currency stays separate from the NGN selling price, and the administrator must review the result before saving or explicitly publishing. Shipping, variants, supplier options and stock are not treated as verified extraction.
 
-## Environment variables
+The Admin importer:
 
-Set these on the **Admin** Vercel project. The publishable key is public configuration; it is not an administrator credential.
+- accepts small JSON requests and limits a page response to 1.5 MB;
+- permits public HTTPS URLs only, rejects local/private/special-use DNS answers, pins the validated address, revalidates redirects, limits redirects and applies an overall timeout;
+- uses a database-backed limit of 10 metadata/image requests per administrator per minute, enforced by the `nextvo_consume_import_rate_limit` RPC;
+- never bypasses CAPTCHA, authentication, paywalls, anti-bot controls or source restrictions.
 
-| Variable | Requirement | Value |
+The database-backed limiter is fail-closed: the Admin SQL setup must be reviewed and applied before either importer endpoint will run. The image-copy action is never automatic. It requires the administrator to confirm reuse rights and source terms, fetches only supported image bytes from a public HTTPS URL, limits the image to 5 MB, checks its actual JPEG/PNG/WebP/AVIF signature, hashes the bytes to reuse duplicates, and stores it in the existing `product-images` Supabase Storage bucket. If copying is not permitted, deselect the image and use an image the business is allowed to publish. The product editor also provides manual uploads and visibly flags any externally hosted image URL; those URLs may stop working if the source changes.
+
+The reviewed storefront migration configures the existing `product-images` bucket as public-read with a 5 MB limit and JPEG/PNG/WebP/AVIF MIME types. The Admin SQL adds narrowly scoped Storage insert/delete policies for authenticated users whose trusted `app_metadata` marks them as an Admin. Delete is needed only for the editor's temporary-upload cleanup after a failed catalogue save; there is no overwrite policy, and public/customer writes remain unavailable. Copied-image original URLs are retained only in the RLS-protected Admin details table, never in the public catalogue. Verify the actual production bucket, size/MIME settings and all existing Storage policies before applying the SQL.
+
+## Review before applying Supabase SQL
+
+`supabase/admin-setup.sql` is a setup script, **not evidence that any production database was changed**. It has not been run against the live Supabase project here. It creates Admin extension tables and functions, enables RLS, adjusts grants, adds missing Admin policies (including Admin-only Storage inserts/deletes), retains copied-image provenance privately, and adds the catalogue tables to Realtime when available. It contains no `DROP TABLE`, `TRUNCATE` or `DROP POLICY`; it adds policies only when that exact policy name is absent, leaving every existing policy definition intact. It still adjusts grants and must be compared with the live database before application.
+
+The public storefront migrations were reviewed read-only for the catalogue fields, the `products.slug` unique constraint, public active-product/category reads, product-image bucket type/size settings and related catalogue tables. This is not a live schema inspection. Before applying the Admin SQL, compare every referenced table, column, constraint, grant, existing RLS policy and Storage policy with the actual Supabase project and take a backup or use a staging clone. PostgreSQL permissive policies are OR-combined: a pre-existing broad policy can remain effective even after this script adds a restrictive Admin policy. Test access as `anon`, an ordinary customer and an Admin before production use. No SQL or production migration was run in this task.
+
+The SQL now also creates the private import-rate-limit table and `nextvo_consume_import_rate_limit` function, plus `nextvo_admin_set_product_status` for a transactionally consistent quick publish/unpublish. It adds private per-image source metadata to the Admin details table and an Admin-only insert policy for `product-images`. Review those additions together with the rest of the setup before applying.
+
+### Assigning the first administrator
+
+The administrator must already exist in Supabase Auth. In Supabase Dashboard → Authentication → Users, select that account and assign trusted **app metadata**:
+
+```json
+{"role":"super_admin"}
+```
+
+Alternatively, after verifying the exact existing Auth UUID, run this account-specific statement in the Supabase SQL Editor:
+
+```sql
+update auth.users
+set raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || '{"role":"super_admin"}'::jsonb
+where id = 'THE_EXISTING_ADMIN_AUTH_USER_UUID';
+```
+
+Do not put this role in `user_metadata`, a profile field, client code or local storage. Sign out and back in to refresh the JWT claim. No credentials or live role changes were made here.
+
+## Vercel and Node configuration
+
+Create a **separate Vercel project** for `AKIRA14-sys/nextvo-admin`, with the repository root as the project root. Set these variables on that Admin Vercel project:
+
+| Variable | Required | Value or purpose |
 | --- | --- | --- |
-| `NEXT_PUBLIC_SUPABASE_URL` | Required | `https://eagalzikryikfibqcpsr.supabase.co` |
-| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Required (preferred) | The existing project's publishable key from Supabase API settings. If that project only exposes an anon key, set `NEXT_PUBLIC_SUPABASE_ANON_KEY` instead. |
-| `NEXT_PUBLIC_STOREFRONT_URL` | Required for product links/sharing | The real customer storefront origin, without a trailing slash. The current storefront route is `/products/<slug>`. |
-| `NEXT_PUBLIC_STORE_NAME` | Optional; defaults to `NEXTVO` | `NEXTVO` |
-| `NEXT_PUBLIC_STORE_CURRENCY` | Optional; defaults to `NGN` | `NGN` |
-| `NEXT_PUBLIC_SITE_URL` | Optional for this build | Admin's own deployed origin; auth redirects derive from the browser's current origin today. |
+| `NEXT_PUBLIC_SUPABASE_URL` | Yes | Existing project URL: `https://eagalzikryikfibqcpsr.supabase.co` |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Yes, preferred | Existing project's publishable key. If only the legacy anon key is available, use the alternative below instead. |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Alternative | Legacy anon key only when the project does not provide a publishable key; do not set both unless intentionally configured. |
+| `NEXT_PUBLIC_STOREFRONT_URL` | Yes for share links | Real customer-facing storefront origin, with no trailing slash. |
+| `NEXT_PUBLIC_STORE_NAME` | Optional | Defaults to `NEXTVO`. |
+| `NEXT_PUBLIC_STORE_CURRENCY` | Optional | Defaults to `NGN`; the product editor itself stores prices in NGN. |
+| `NEXT_PUBLIC_SITE_URL` | Optional | Admin origin; current auth redirects use the active Admin origin. |
 
-There are **no private server environment variables required** in this version. Do not add `SUPABASE_SERVICE_ROLE_KEY` to Vercel, this repository, or any `NEXT_PUBLIC_*` variable.
+There are no private environment variables required by this Admin code. Do **not** add `SUPABASE_SERVICE_ROLE_KEY` here, in browser variables, GitHub or local storage. A future storefront on-demand revalidation route would need its own server-only secret in the storefront deployment; that change is not part of this Admin repository.
 
-For local development, copy `.env.example` to `.env.local`, fill the two Supabase public settings and the storefront URL, then run `npm install` and `npm run dev`.
+Use **Node.js 22.19.0 or later within the Node 22 line**. `package.json` declares `>=22.19.0 <23.0.0`; `.nvmrc` and GitHub Actions use 22.19.0. The locked `undici` dependency requires this minimum. Configure the Admin Vercel project's Node.js version to 22.x (22.19.0 or later).
 
-## Deploy separately with Vercel
+## Storefront synchronization, SEO and URL limits
 
-1. Import `AKIRA14-sys/nextvo-admin` as a new Vercel project. Keep the project root at `/` and use the Next.js framework preset.
-2. Add the environment variables above to Preview and Production. Add them before the production build.
-3. Deploy `main`. Vercel's normal Next.js install/build settings use `npm install` and `npm run build`.
-4. Add the deployed Admin URL to Supabase Auth's allowed redirect URLs.
-5. Open the HTTPS Admin URL in Chrome on Android. Use Chrome's menu → **Install app** or **Add to Home screen**. The service worker caches only the offline fallback and icon files; Admin pages, API calls and private data remain network-only.
+The Admin writes catalogue changes directly to the shared Supabase tables. The read-only review of the current storefront source found that its public product query filters on `products.active = true`, while the sitemap is dynamic. Its product/category data helpers use request-scoped React memoization and no explicit persistent Next.js data cache was found. That is consistent with changed data appearing on the next server request without a new Vercel deployment, but no live storefront request or deployed CDN/browser cache test was possible. Realtime alone is not relied on to invalidate a server-rendered cache.
 
-## Important boundaries and not-yet-configured work
+The storefront source was not changed. Its existing SEO controls include a dynamic sitemap, an environment-gated `robots.ts`, and public Product JSON-LD. The reviewed product route currently lacks a product canonical URL, the category route lacks canonical metadata, and sitemap product dates use `created_at`; these need a separate storefront patch to add current canonicals/metadata and use `updated_at`. Keep public indexing disabled until the real production domain is configured and verified. The Admin PWA itself has `noindex`/`nofollow` metadata and authenticated responses are marked `private, no-store`.
 
-- The Admin app has **not** been connected to Vercel or deployed here. The user supplies Vercel settings and domain from their phone.
-- The database SQL has **not** been applied or exercised against the live project in this build environment. No admin role, key or live catalogue connection was present, so live product-write, RLS, Storage and end-to-end synchronization tests remain outstanding.
-- Admin mutations use the shared Supabase tables, so new/edited/published catalogue rows are written without a storefront redeploy. The existing storefront repository was intentionally left untouched. A server-side on-demand revalidation/webhook and the requested customer-facing SEO follow-up still need a separately reviewed storefront change; this code alone cannot guarantee instant refresh of an already-rendered or browser-cached storefront page.
-- The storefront currently exposes `/products/<slug>` links. The Admin builds those links from `NEXT_PUBLIC_STOREFRONT_URL`; it does not create a second storefront or an Admin-only product route. The login “remember” option stores only the email address on that device; it never stores the password or tokens.
-- The existing storefront README says checkout is disabled and no provider/webhook exists. The Orders view never treats its legacy `orders.payment_status` value as proof of payment. Revenue and Analytics read only `nextvo_verified_payments`; the Admin payment page is read-only, and only a separately configured trusted server/webhook can populate this ledger. Until then, verified sales correctly remain empty.
-- Analytics are constrained to fields and records available in the existing schema. No sales, profit, payment or customer-growth values are synthesized. The profit calculator is an estimate, not realized profit.
-- Store settings are limited to the Admin extension and are not wired to customer-facing behavior. Push notifications, Firebase and FCM are intentionally not included. The notification bell is an informational placeholder; a notification center is not implemented.
-- Future Product Manager, Order Manager, Inventory Manager and Customer Support roles are listed as roadmap only; until permission-specific RLS is implemented, only `admin`/`super_admin` claims can enter.
-- This build does not change the storefront SEO code. The live code review found existing sitemap/robots routes, general metadata, structured product data, and server-side Supabase product retrieval; canonical/product-specific metadata and the requested cache-revalidation work require a separately approved storefront patch. No indexing or Google Search Console result is claimed.
+The existing storefront does not use Admin settings. The Admin settings page now labels every stored value as Admin-only; they do not change customer-facing store availability, announcement, shipping, contact or currency behavior. Connecting those settings requires a separate secure storefront implementation that exposes only public-safe values.
 
-## Useful commands
+The storefront has not completed live checkout/payment integration. Orders are existing records with fulfillment views, not proof of new customer transactions; payment status is not verified from client input. Payments/revenue remain read-only and empty until a separately authorized server-side payment-provider webhook verifies signatures, handles idempotency/refunds and writes the verified ledger. Fulfillment and order creation must also be connected to the future checkout flow.
+
+## PWA and privacy
+
+The manifest, app icons and offline fallback are included. The service worker caches only the offline page, icons and fingerprinted Next static assets; Admin pages, API responses, customer data and auth tokens are network-only. Offline mode does not claim to support private Admin operations. Cache cleanup is limited to cache names owned by this PWA, and an available PWA update can be applied through an explicit reload prompt.
+
+Install from HTTPS Chrome on Android via **Install app** or **Add to Home screen**. The project has responsive mobile layouts, but installation, keyboard behavior and image upload have not been tested on a physical Android device in this environment.
+
+## Automated checks
+
+Run:
 
 ```bash
-npm run dev
-npm run typecheck
+npm ci
+npm test
 npm run lint
+npm run typecheck
 npm run build
 ```
+
+GitHub Actions runs these same checks on pushes and pull requests to `main`. Unit tests cover trusted-role checks, save-status behavior, USD/GBP/EUR/NGN price separation, preservation of existing product attributes, supported image signatures, DNS-pinned SSRF filters, unsafe redirects and response-size bounds; `node --check public/sw.js` checks the service-worker syntax. Live RLS, Storage, product-write, storefront-visibility and device-installation checks require the real Supabase configuration and an appropriate staging/deployment environment; they are not claimed as tested here.

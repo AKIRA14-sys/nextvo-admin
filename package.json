@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint src --ext .ts,.tsx",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts"
   },
   "keywords": [
     "nextvo",
@@ -15,6 +16,9 @@
     "pwa"
   ],
   "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.19.0 <23.0.0"
+  },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",
     "@supabase/supabase-js": "^2.119.0",
@@ -33,6 +37,7 @@
     "@types/react-dom": "^19.3.0",
     "eslint": "^8.57.1",
     "eslint-config-next": "^15.5.29",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   },
   "overrides": {

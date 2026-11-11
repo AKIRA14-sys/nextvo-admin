@@ -6,12 +6,18 @@ const url = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim() || "";
 const key = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim() || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim() || "";
 const protectedPaths = ["/dashboard", "/products", "/import", "/categories", "/inventory", "/orders", "/customers", "/profit", "/analytics", "/settings", "/account"];
 
+function noStore(response: NextResponse) {
+  response.headers.set("Cache-Control", "private, no-store, max-age=0, must-revalidate");
+  response.headers.set("Pragma", "no-cache");
+  return response;
+}
+
 export async function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
   const requiresAdmin = protectedPaths.some((path) => pathname === path || pathname.startsWith(`${path}/`));
   if (!url || !key) {
-    if (requiresAdmin) return NextResponse.redirect(new URL("/login?setup=1", request.url));
-    return NextResponse.next();
+    if (requiresAdmin) return noStore(NextResponse.redirect(new URL("/login?setup=1", request.url)));
+    return noStore(NextResponse.next());
   }
 
   let response = NextResponse.next({ request });
@@ -22,22 +28,22 @@ export async function middleware(request: NextRequest) {
         items.forEach(({ name, value }) => request.cookies.set(name, value));
         response = NextResponse.next({ request });
         items.forEach(({ name, value, options }) => response.cookies.set(name, value, options));
-      }
-    }
+      },
+    },
   });
   const { data: { user } } = await supabase.auth.getUser();
 
   if (pathname === "/") {
     const destination = user && isAuthorizedAdmin(user) ? "/dashboard" : "/login";
-    return NextResponse.redirect(new URL(destination, request.url));
+    return noStore(NextResponse.redirect(new URL(destination, request.url)));
   }
   if (requiresAdmin && (!user || !isAuthorizedAdmin(user))) {
     const destination = user ? "/unauthorized" : "/login";
-    return NextResponse.redirect(new URL(destination, request.url));
+    return noStore(NextResponse.redirect(new URL(destination, request.url)));
   }
-  return response;
+  return noStore(response);
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico|icon-192.png|icon-512.png|sw.js|offline.html|manifest.webmanifest).*)"]
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|icon-192.png|icon-512.png|sw.js|offline.html|manifest.webmanifest).*)"],
 };

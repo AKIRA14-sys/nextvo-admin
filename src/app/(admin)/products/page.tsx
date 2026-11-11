@@ -19,12 +19,28 @@ export default function ProductsPage() {
     const { data, error } = await db.from("products").select("id,slug,name,description,price_ngn,compare_at_price_ngn,image_url,stock_quantity,active,featured,created_at,category_id,subcategory_id,currency_code,brand,attributes,search_terms,is_new_arrival").order("created_at", { ascending: false }).range(0, 99);
     if (error) { setError(`${safeError(error)} Apply the admin SQL setup and check your administrator role.`); setLoading(false); return; }
     const rows = (data || []) as Product[]; setProducts(rows);
-    if (rows.length) { const { data: privateRows, error: detailsError } = await db.from("nextvo_admin_product_details").select("product_id,status,supplier_name,supplier_product_url,supplier_price,supplier_currency,short_description").in("product_id", rows.map((p) => p.id)); if (detailsError) { setMissingSetup(true); } else { setDetails(Object.fromEntries((privateRows || []).map((d: any) => [d.product_id, d as Details]))); setMissingSetup(false); } } else setMissingSetup(false);
+    if (rows.length) { const { data: privateRows, error: detailsError } = await db.from("nextvo_admin_product_details").select("product_id,status,supplier_name,supplier_product_url,supplier_price,supplier_currency,short_description").in("product_id", rows.map((p) => p.id)); if (detailsError) { setMissingSetup(true); } else { setDetails(Object.fromEntries(((privateRows || []) as Details[]).map((d) => [d.product_id, d]))); setMissingSetup(false); } } else setMissingSetup(false);
     setLoading(false);
   }, []);
   useEffect(() => { void load(); if (!SUPABASE_CONFIGURED) return; const db = getSupabaseBrowserClient(); const channel = db.channel("products-list-live").on("postgres_changes", { event: "*", schema: "public", table: "products" }, () => void load()).subscribe(); return () => { void db.removeChannel(channel); }; }, [load]);
   const shown = useMemo(() => products.filter((p) => { const status = details[p.id]?.status || (p.active ? "published" : "unpublished"); const matched = !search || `${p.name} ${p.slug} ${p.brand || ""}`.toLowerCase().includes(search.toLowerCase()); const byFilter = filter === "All" || (filter === "Published" && status === "published") || (filter === "Draft" && status === "draft") || (filter === "Unpublished" && status === "unpublished") || (filter === "Unavailable" && status === "unavailable") || (filter === "Out of stock" && p.stock_quantity <= 0); return matched && byFilter; }), [products, details, filter, search]);
-  async function toggle(p: Product) { const db = getSupabaseBrowserClient(); const old = details[p.id] || { product_id: p.id, status: p.active ? "published" : "unpublished", supplier_name: "", supplier_product_url: "", supplier_price: null, supplier_currency: "NGN", short_description: "" }; const next = p.active ? "unpublished" : "published"; setBusy(p.id); setError(""); try { if (p.active) { const { error } = await db.from("products").update({ active: false }).eq("id", p.id); if (error) throw error; const { error: de } = await db.from("nextvo_admin_product_details").upsert({ ...old, status: next, updated_at: new Date().toISOString() }); if (de) throw de; } else { const { error: de } = await db.from("nextvo_admin_product_details").upsert({ ...old, status: next, updated_at: new Date().toISOString() }); if (de) throw de; const { error } = await db.from("products").update({ active: true }).eq("id", p.id); if (error) throw error; } await load(); } catch (e) { setError(`No change was confirmed: ${safeError(e)}`); } finally { setBusy(null); } }
+  async function toggle(p: Product) {
+    const next = p.active ? "unpublished" : "published";
+    setBusy(p.id);
+    setError("");
+    try {
+      const { error } = await getSupabaseBrowserClient().rpc("nextvo_admin_set_product_status", {
+        p_product_id: p.id,
+        p_status: next,
+      });
+      if (error) throw error;
+      await load();
+    } catch (caught) {
+      setError(`No status change was confirmed: ${safeError(caught)}`);
+    } finally {
+      setBusy(null);
+    }
+  }
   async function remove(p: Product) { if (!window.confirm(`Permanently delete “${p.name}”? This also removes its variants and image records. This cannot be undone.`)) return; setBusy(p.id); try { const { error } = await getSupabaseBrowserClient().from("products").delete().eq("id", p.id); if (error) throw error; await load(); } catch (e) { setError(safeError(e)); } finally { setBusy(null); } }
   async function copyLink(p: Product) { const href = `${STOREFRONT_URL}/products/${p.slug}`; if (!STOREFRONT_URL) { setError("Set NEXT_PUBLIC_STOREFRONT_URL in the Admin deployment to enable product sharing."); return; } try { await navigator.clipboard.writeText(href); } catch { setError("Could not access clipboard. Copy the product URL from the edit screen instead."); } }
   return <><div className="page-heading"><div><div className="eyebrow">SHARED CATALOGUE</div><h1>Products</h1><p>Manage real NEXTVO catalogue records. Publishing controls public visibility.</p></div><div className="actions"><button className="button ghost" onClick={load} disabled={loading}><RefreshCw size={15}/>Refresh</button><Link href="/products/new" className="button primary"><Plus size={15}/>Add product</Link></div></div>
