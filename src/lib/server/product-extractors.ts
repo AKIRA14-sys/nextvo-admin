@@ -362,9 +362,11 @@ export type ExtractedSupplierProduct = {
 
 export function extractSupplierProduct(html: string, originalUrl: URL, finalUrl: URL): ExtractedSupplierProduct {
   const host = originalUrl.hostname.toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
-  const adapter = adapterFor(host);
+  const finalHost = finalUrl.hostname.toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
+  const requestedAdapter = adapterFor(host);
+  const adapter = requestedAdapter.name ? requestedAdapter : adapterFor(finalHost);
   const structured = productJson(html);
-  const is1688 = host === "1688.com" || host.endsWith(".1688.com");
+  const is1688 = host === "1688.com" || host.endsWith(".1688.com") || finalHost === "1688.com" || finalHost.endsWith(".1688.com");
   const contextData = is1688 ? public1688Product(public1688Context(html)) : null;
   const rawBrand = structured?.brand;
   const brand = cleanText(typeof rawBrand === "string" ? rawBrand : asRecord(rawBrand)?.name, 120) || cleanText(metaValue(html, adapter.brandMeta), 120);
@@ -405,8 +407,8 @@ export function extractSupplierProduct(html: string, originalUrl: URL, finalUrl:
     model,
     variants: variantLabels(structured).length ? variantLabels(structured) : publicFacts.variants,
     attributes,
-    supplier_name: adapter.name || host,
-    supplier_host: originalUrl.hostname,
+    supplier_name: adapter.name || finalHost,
+    supplier_host: finalUrl.hostname,
     source_url: originalUrl.toString(),
     final_url: finalUrl.toString(),
   };

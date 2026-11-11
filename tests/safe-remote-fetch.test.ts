@@ -28,6 +28,31 @@ test("safe fetch follows a valid public HTTPS redirect and returns final URL/bod
   assert.equal(new TextDecoder().decode(result.body), "product");
 });
 
+test("safe fetch upgrades an HTTP redirect to HTTPS without sending plaintext", async () => {
+  const seen: string[] = [];
+  const fetcher = async (url: URL) => {
+    seen.push(url.href);
+    return seen.length === 1
+      ? new Response(null, { status: 301, headers: { location: "http://cdn.supplier.example/item" } })
+      : html("secure product");
+  };
+  const result = await fetchPublicResource(new URL("https://supplier.example/item"), options, publicDns, fetcher);
+  assert.deepEqual(seen, ["https://supplier.example/item", "https://cdn.supplier.example/item"]);
+  assert.equal(result.url.href, "https://cdn.supplier.example/item");
+});
+
+test("safe fetch rejects HTTP redirects to private destinations and unsupported ports", async () => {
+  let requests = 0;
+  const redirect = async () => {
+    requests += 1;
+    return new Response(null, { status: 302, headers: { location: "http://127.0.0.1/admin" } });
+  };
+  await expectCode(fetchPublicResource(new URL("https://supplier.example/"), options, publicDns, redirect), "blocked_destination");
+  await expectCode(fetchPublicResource(new URL("https://supplier.example/"), options, publicDns,
+    async () => new Response(null, { status: 302, headers: { location: "http://cdn.supplier.example:8080/item" } })), "redirect_validation_failure");
+  assert.equal(requests, 1);
+});
+
 test("safe fetch rejects a redirect to a private DNS destination before requesting it", async () => {
   let requests = 0;
   const resolver = async (host: string) => host === "supplier.example"

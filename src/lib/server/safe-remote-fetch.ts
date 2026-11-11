@@ -169,7 +169,13 @@ export async function fetchPublicResource(
         if (!location) throw new ImportDiagnosticError("redirect_validation_failure");
         if (hop === maxRedirects) throw new ImportDiagnosticError("redirect_limit");
         try {
-          url = new URL(location, url);
+          const nextUrl = new URL(location, url);
+          if (nextUrl.protocol === "http:") {
+            if (nextUrl.port && nextUrl.port !== "80") throw new Error("Unsupported insecure redirect port");
+            nextUrl.protocol = "https:";
+            nextUrl.port = "";
+          }
+          url = nextUrl;
         } catch (error) {
           throw new ImportDiagnosticError("redirect_validation_failure", error);
         }

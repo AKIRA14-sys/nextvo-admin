@@ -34,6 +34,17 @@ test("Temu metadata uses declared product facts and does not fabricate currency"
   assert.equal(item.currency, "");
 });
 
+test("Temu short links use the resolved supplier adapter and preserve original source provenance", () => {
+  const source = new URL("https://share.temu.com/short-code");
+  const final = new URL("https://www.temu.com/item.html");
+  const item = extractSupplierProduct('<meta name="twitter:title" content="Storage box"><meta property="product:price:amount" content="12.99">', source, final);
+  assert.equal(item.supplier_name, "Temu");
+  assert.equal(item.supplier_host, "www.temu.com");
+  assert.equal(item.source_url, source.toString());
+  assert.equal(item.final_url, final.toString());
+  assert.equal(item.price, "12.99");
+});
+
 test("generic JSON-LD extracts model, attributes, variants and structured price", () => {
   const html = `<script type="application/ld+json">${JSON.stringify({
     "@context": "https://schema.org", "@type": "Product", name: "Trail jacket", model: "TJ-42", sku: "SKU-42", color: "Forest",

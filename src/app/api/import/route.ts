@@ -99,6 +99,7 @@ export async function POST(request: NextRequest) {
   if (allowed !== true) return json({ error: "Import limit reached. Wait one minute before trying again.", request_id: requestId }, 429, { ...responseHeaders, "Retry-After": "60" });
 
   const originalUrl = new URL(parsed.data.url);
+  let historyUrl = originalUrl;
   let product: ReturnType<typeof extractSupplierProduct> | null = null;
   let retrievalError: unknown;
   try {
@@ -109,6 +110,7 @@ export async function POST(request: NextRequest) {
       accept: "text/html,application/xhtml+xml,application/ld+json;q=0.9,*/*;q=0.2",
       userAgent: "NEXTVO-Catalog-Assistant/1.0 (+manual product review)",
     });
+    historyUrl = fetched.url;
     const pageMime = fetched.contentType.split(";")[0].trim().toLowerCase();
     let html = new TextDecoder("utf-8").decode(fetched.body);
     if (pageMime === "application/ld+json") html = `<script type="application/ld+json">${html}</script>`;
@@ -126,7 +128,7 @@ export async function POST(request: NextRequest) {
   let history: Awaited<ReturnType<typeof recordImport>> | null = null;
   let historyWarning = "";
   try {
-    history = await recordImport(supabase, user.id, originalUrl, diagnostic ? "failed" : "retrieved", diagnostic ? "" : product?.title || "", diagnostic?.message.slice(0, 220) || "");
+    history = await recordImport(supabase, user.id, historyUrl, diagnostic ? "failed" : "retrieved", diagnostic ? "" : product?.title || "", diagnostic?.message.slice(0, 220) || "");
   } catch (error) {
     logImportFailure({ requestId, operation: "metadata", supplierHost: sanitizedSupplierHost(originalUrl), error, elapsedMs: Date.now() - startedAt });
     historyWarning = "This attempt could not be saved to import history. Check the Admin history table and permissions; the result is not recorded.";

@@ -17,9 +17,11 @@ type History = {
 type RouteDependencies = {
   user: { id: string; app_metadata?: Record<string, unknown> } | null;
   authorized?: boolean;
+  restricted?: boolean;
   allowed?: unknown;
   rpcError?: unknown;
   fetchError?: Error;
+  finalUrl?: string;
   historyError?: unknown;
   eventOrder?: string[];
   fetchCalls?: number;
@@ -73,11 +75,11 @@ function loadRoute(path: string, deps: RouteDependencies) {
         deps.fetchCalls = (deps.fetchCalls ?? 0) + 1;
         deps.eventOrder?.push("fetch");
         if (deps.fetchError) throw deps.fetchError;
-        return { body: new TextEncoder().encode(productSource), contentType: "text/html; charset=utf-8", url: new URL("https://supplier.example/item") };
+        return { body: new TextEncoder().encode(productSource), contentType: "text/html; charset=utf-8", url: new URL(deps.finalUrl || "https://supplier.example/item") };
       },
     },
     "@/lib/server/product-extractors": {
-      looksLikeSupplierRestriction: () => false,
+      looksLikeSupplierRestriction: () => deps.restricted ?? false,
       extractSupplierProduct: () => ({ title: "Mock product", description: "Description", images: [], price: "", currency: "", sku: "", brand: "", source_url: "https://supplier.example/item", supplier_host: "supplier.example" }),
       hasPublicProductMetadata: () => true,
     },
@@ -145,6 +147,30 @@ test("metadata route awaits history persistence and returns the confirmed histor
   assert.equal(body.history_id, "history-1");
   assert.equal(body.title, "Mock product");
   assert.equal(deps.historyInput?.created_by, "admin-1");
+});
+
+test("metadata route records the final supplier URL and host after a public redirect", async () => {
+  const finalUrl = "https://www.temu.com/goods.html?goods_id=123";
+  const deps = adminDeps({ finalUrl });
+  const { POST } = loadRoute("src/app/api/import/route.ts", deps);
+  const response = await POST(request());
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(deps.historyInput?.source_url, finalUrl);
+  assert.equal(deps.historyInput?.supplier_host, "www.temu.com");
+  assert.equal(body.history.source_url, finalUrl);
+});
+
+test("metadata route keeps the resolved URL in failed history when the final page is restricted", async () => {
+  const finalUrl = "https://www.temu.com/goods.html?goods_id=123";
+  const deps = adminDeps({ finalUrl, restricted: true });
+  const { POST } = loadRoute("src/app/api/import/route.ts", deps);
+  const response = await POST(request());
+  const body = await response.json();
+  assert.equal(response.status, 422);
+  assert.equal(deps.historyInput?.source_url, finalUrl);
+  assert.equal(deps.historyInput?.supplier_host, "www.temu.com");
+  assert.equal(body.history.status, "failed");
 });
 
 test("metadata route records failed retrieval with a safe diagnostic", async () => {

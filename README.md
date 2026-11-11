@@ -21,7 +21,7 @@ Import supports public page metadata and Product JSON-LD when available; it is n
 The Admin importer:
 
 - accepts small JSON requests and limits a page response to 1.5 MB;
-- permits public HTTPS URLs only, rejects local/private/special-use DNS answers, pins the validated address, revalidates redirects, limits redirects and applies an overall timeout;
+- permits public HTTPS URLs only, rejects local/private/special-use DNS answers, pins the validated address, upgrades an HTTP redirect target to HTTPS without sending a plaintext request, revalidates every redirect, limits redirects and applies an overall timeout;
 - uses a database-backed limit of 10 metadata/image requests per administrator per minute, enforced by the `nextvo_consume_import_rate_limit` RPC;
 - never bypasses CAPTCHA, authentication, paywalls, anti-bot controls or source restrictions.
 
