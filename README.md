@@ -71,7 +71,7 @@ Create a **separate Vercel project** for `AKIRA14-sys/nextvo-admin`, with the re
 
 There are no private environment variables required by this Admin code. Do **not** add `SUPABASE_SERVICE_ROLE_KEY` here, in browser variables, GitHub or local storage. A future storefront on-demand revalidation route would need its own server-only secret in the storefront deployment; that change is not part of this Admin repository.
 
-Use **Node.js 22.19.0 or later within the Node 22 line**. `package.json` declares `>=22.19.0 <23.0.0`; `.nvmrc` and GitHub Actions use 22.19.0. The locked `undici` dependency requires this minimum. Configure the Admin Vercel project's Node.js version to 22.x (22.19.0 or later).
+Use **Node.js 22.19.0 or later within the Node 22 line**. `package.json` declares `>=22.19.0 <23.0.0`; `.nvmrc` pins 22.23.4 for local development, while GitHub Actions uses 22.19.0. The locked `undici` dependency requires this minimum, and `npm run build` checks that its runtime is Node 22.19.0 or later. In Vercel, open the existing Admin project → **Settings → Build and Deployment → Node.js Version** and choose **22.x**, then run a new production deployment and verify the build/runtime version. Vercel settings and production deployment have not been changed or verified from this environment.
 
 ## Storefront synchronization, SEO and URL limits
 

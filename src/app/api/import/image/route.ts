@@ -1,8 +1,9 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { validateProductImage } from "@/lib/image-validation";
 import { fetchPublicResource } from "@/lib/server/safe-remote-fetch";
+import { ImportDiagnosticError, logImportFailure, publicImportDiagnostic, sanitizedSupplierHost } from "@/lib/server/import-diagnostics";
 import { isAuthorizedAdmin } from "@/lib/supabase/config";
 import { getSupabaseServerClient } from "@/lib/supabase/server";
 
@@ -40,6 +41,8 @@ async function readBody(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  const requestId = randomUUID();
+  const startedAt = Date.now();
   const supabase = await getSupabaseServerClient();
   if (!supabase) return json({ error: "Supabase is not configured." }, 503);
   const { data: { user } } = await supabase.auth.getUser();
@@ -55,7 +58,7 @@ export async function POST(request: NextRequest) {
     p_window_seconds: 60,
     p_max_requests: 10,
   });
-  if (rateLimitError) return json({ error: "Importer throttling is not configured. Review and apply the Admin SQL setup before importing images." }, 503);
+  if (rateLimitError) return json({ error: "Importer throttling is unavailable. Check the existing Admin rate-limit function and permissions." }, 503);
   if (allowed !== true) return json({ error: "Image import limit reached. Wait one minute before trying again." }, 429, { "Retry-After": "60" });
 
   try {
@@ -66,7 +69,9 @@ export async function POST(request: NextRequest) {
       accept: "image/jpeg,image/png,image/webp,image/avif",
       userAgent: "NEXTVO-Admin-Image-Import/1.0 (+administrator-request)",
     });
-    const mime = validateProductImage(fetched.body, fetched.contentType);
+    let mime: string;
+    try { mime = validateProductImage(fetched.body, fetched.contentType); }
+    catch (error) { throw new ImportDiagnosticError("image_validation_failure", error); }
     const extension = ({ "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/avif": "avif" } as const)[mime as "image/jpeg" | "image/png" | "image/webp" | "image/avif"];
     const digest = createHash("sha256").update(fetched.body).digest("hex");
     const filename = `${digest}.${extension}`;
@@ -81,13 +86,15 @@ export async function POST(request: NextRequest) {
     if (uploadError) {
       const { data: existing, error: listError } = await storage.list("imported", { search: filename, limit: 100 });
       if (listError || !existing?.some((file) => file.name === filename)) {
-        throw new Error(`Could not save the image to the product-images bucket: ${uploadError.message}`);
+        throw new ImportDiagnosticError("storage_failure", uploadError);
       }
     }
 
     const { data } = storage.getPublicUrl(objectPath);
-    return json({ image_url: data.publicUrl, source_url: parsed.data.url, duplicate: Boolean(uploadError) });
+    return json({ image_url: data.publicUrl, source_url: parsed.data.url, duplicate: Boolean(uploadError), request_id: requestId }, 200, { "X-Request-ID": requestId });
   } catch (error) {
-    return json({ error: error instanceof Error ? error.message : "Could not import this image." }, 422);
+    logImportFailure({ requestId, operation: "image", supplierHost: sanitizedSupplierHost(new URL(parsed.data.url)), error, elapsedMs: Date.now() - startedAt });
+    const diagnostic = publicImportDiagnostic(error, requestId);
+    return json({ error: diagnostic.message, code: diagnostic.code, request_id: requestId }, 422, { "X-Request-ID": requestId });
   }
 }

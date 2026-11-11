@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { fetchPublicResource } from "@/lib/server/safe-remote-fetch";
+import { ImportDiagnosticError, logImportFailure, publicImportDiagnostic, sanitizedSupplierHost } from "@/lib/server/import-diagnostics";
+import { extractSupplierProduct, hasPublicProductMetadata, looksLikeSupplierRestriction } from "@/lib/server/product-extractors";
 import { isAuthorizedAdmin } from "@/lib/supabase/config";
 import { getSupabaseServerClient } from "@/lib/supabase/server";
 
@@ -11,6 +14,7 @@ const bodySchema = z.object({ url: z.string().trim().url().max(2048) });
 const maxBodyBytes = 4096;
 const maxPageBytes = 1_500_000;
 const noStore = { "Cache-Control": "private, no-store, max-age=0" };
+const historyColumns = "id,source_url,supplier_host,status,imported_title,error_summary,created_at";
 
 function json(body: unknown, status = 200, extraHeaders: Record<string, string> = {}) {
   return NextResponse.json(body, { status, headers: { ...noStore, ...extraHeaders } });
@@ -50,147 +54,53 @@ async function readBoundedJson(request: NextRequest): Promise<unknown> {
   }
 }
 
-function decodeHtml(value: string) {
-  return value
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&#(\d+);/g, (_, n) => {
-      try { return String.fromCodePoint(Number(n)); } catch { return ""; }
-    })
-    .replace(/&#x([0-9a-f]+);/gi, (_, n) => {
-      try { return String.fromCodePoint(parseInt(n, 16)); } catch { return ""; }
-    })
-    .trim();
-}
-
-function attr(tag: string, name: string) {
-  const match = tag.match(new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i"));
-  return decodeHtml(match?.[1] || match?.[2] || match?.[3] || "");
-}
-
-function meta(html: string, key: string, value: string) {
-  const tags = html.match(/<meta\b[^>]*>/gi) || [];
-  for (const tag of tags) if (attr(tag, key).toLowerCase() === value.toLowerCase()) return attr(tag, "content");
-  return "";
-}
-
-function cleanText(value: string, limit: number) {
-  return decodeHtml(value.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ")).slice(0, limit);
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
-}
-
-function findProductJson(node: unknown): Record<string, unknown> | null {
-  if (Array.isArray(node)) {
-    for (const item of node) { const found = findProductJson(item); if (found) return found; }
-    return null;
-  }
-  const object = asRecord(node);
-  if (!object) return null;
-  const type = object["@type"];
-  if (type === "Product" || (Array.isArray(type) && type.includes("Product"))) return object;
-  for (const value of Object.values(object)) { const found = findProductJson(value); if (found) return found; }
-  return null;
-}
-
-function productJson(html: string): Record<string, unknown> | null {
-  const scripts = html.match(/<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/gi) || [];
-  for (const script of scripts) {
-    const jsonText = script.replace(/^<script\b[^>]*>/i, "").replace(/<\/script>$/i, "").trim();
-    try { const found = findProductJson(JSON.parse(jsonText)); if (found) return found; } catch { /* malformed JSON-LD is ignored */ }
-  }
-  return null;
-}
-
-function parsePage(html: string, source: URL) {
-  const structured = productJson(html);
-  const rawOffer = structured?.offers;
-  const offer = Array.isArray(rawOffer) ? asRecord(rawOffer[0]) : asRecord(rawOffer);
-  const structuredBrand = structured?.brand;
-  const brandRecord = asRecord(structuredBrand);
-  const brandName = typeof structuredBrand === "string" ? structuredBrand : typeof brandRecord?.name === "string" ? brandRecord.name : "";
-  const title = cleanText(
-    (typeof structured?.name === "string" ? structured.name : "") || meta(html, "property", "og:title") || meta(html, "name", "twitter:title") ||
-      ((html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || ""),
-    240,
-  );
-  const description = cleanText(
-    (typeof structured?.description === "string" ? structured.description : "") || meta(html, "property", "og:description") || meta(html, "name", "description"),
-    2000,
-  );
-  const rawImages = structured?.image || meta(html, "property", "og:image") || meta(html, "name", "twitter:image") || [];
-  const imageList = Array.isArray(rawImages) ? rawImages : [rawImages];
-  const imageValues = imageList.map((item) => {
-    if (typeof item === "string") return item;
-    const image = asRecord(item);
-    return typeof image?.url === "string" ? image.url : "";
-  }).filter((value): value is string => Boolean(value));
-  const images = Array.from(new Set(imageValues.map((value) => {
-      try {
-        const image = new URL(value, source);
-        return image.protocol === "https:" && !image.username && !image.password ? image.toString() : "";
-      } catch { return ""; }
-    }).filter(Boolean))).slice(0, 8);
-  const price = offer?.price ?? meta(html, "property", "product:price:amount") ?? meta(html, "itemprop", "price");
-  const currency = offer?.priceCurrency ?? meta(html, "property", "product:price:currency") ?? meta(html, "itemprop", "priceCurrency");
-  return {
-    title,
-    description,
-    images,
-    price: price !== undefined && price !== null && Number.isFinite(Number(price)) ? String(price) : "",
-    currency: typeof currency === "string" && /^[A-Za-z]{3}$/.test(currency.trim()) ? currency.trim().toUpperCase() : "",
-    sku: cleanText(typeof structured?.sku === "string" || typeof structured?.sku === "number" ? String(structured.sku) : "", 80),
-    brand: cleanText(brandName, 120),
-    source_url: source.toString(),
-    supplier_host: source.hostname,
-  };
-}
-
 async function recordImport(
   supabase: NonNullable<Awaited<ReturnType<typeof getSupabaseServerClient>>>,
   userId: string,
-  url: string,
-  host: string,
+  url: URL,
   status: "retrieved" | "failed",
   title: string,
   errorSummary: string,
 ) {
-  const { data } = await supabase
+  const source = new URL(url);
+  source.username = "";
+  source.password = "";
+  const { data, error } = await supabase
     .from("nextvo_import_history")
-    .insert({ source_url: url, supplier_host: host, status, imported_title: title, error_summary: errorSummary, created_by: userId })
-    .select("id")
-    .maybeSingle();
-  return data?.id || null;
+    .insert({ source_url: source.toString(), supplier_host: sanitizedSupplierHost(url), status, imported_title: title, error_summary: errorSummary, created_by: userId })
+    .select(historyColumns)
+    .single();
+  if (error || !data) throw new ImportDiagnosticError("history_persistence_failure", error);
+  return data;
 }
 
 export async function POST(request: NextRequest) {
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  const responseHeaders = { "X-Request-ID": requestId };
   const supabase = await getSupabaseServerClient();
-  if (!supabase) return json({ error: "Supabase is not configured." }, 503);
+  if (!supabase) return json({ error: "Supabase is not configured.", request_id: requestId }, 503, responseHeaders);
   const { data: { user } } = await supabase.auth.getUser();
-  if (!user || !isAuthorizedAdmin(user)) return json({ error: "Administrator access required." }, 403);
+  if (!user || !isAuthorizedAdmin(user)) return json({ error: "Administrator access required.", request_id: requestId }, 403, responseHeaders);
 
   let raw: unknown;
   try { raw = await readBoundedJson(request); }
-  catch (error) { return json({ error: error instanceof Error ? error.message : "Provide a valid product URL." }, 400); }
+  catch (error) { return json({ error: error instanceof Error ? error.message : "Provide a valid product URL.", request_id: requestId }, 400, responseHeaders); }
   const parsed = bodySchema.safeParse(raw);
-  if (!parsed.success) return json({ error: "Enter a valid public product URL." }, 400);
+  if (!parsed.success) return json({ error: "Enter a valid public product URL.", request_id: requestId }, 400, responseHeaders);
 
   const { data: allowed, error: rateLimitError } = await supabase.rpc("nextvo_consume_import_rate_limit", {
     p_window_seconds: 60,
     p_max_requests: 10,
   });
   if (rateLimitError) {
-    return json({ error: "Importer throttling is not configured. Review and apply the Admin SQL setup before enabling imports." }, 503);
+    return json({ error: "Importer throttling is unavailable. Check the existing Admin rate-limit function and permissions.", request_id: requestId }, 503, responseHeaders);
   }
-  if (allowed !== true) return json({ error: "Import limit reached. Wait one minute before trying again." }, 429, { "Retry-After": "60" });
+  if (allowed !== true) return json({ error: "Import limit reached. Wait one minute before trying again.", request_id: requestId }, 429, { ...responseHeaders, "Retry-After": "60" });
 
   const originalUrl = new URL(parsed.data.url);
+  let product: ReturnType<typeof extractSupplierProduct> | null = null;
+  let retrievalError: unknown;
   try {
     const fetched = await fetchPublicResource(originalUrl, {
       maxBytes: maxPageBytes,
@@ -200,16 +110,30 @@ export async function POST(request: NextRequest) {
       userAgent: "NEXTVO-Catalog-Assistant/1.0 (+manual product review)",
     });
     const pageMime = fetched.contentType.split(";")[0].trim().toLowerCase();
-    if (!["text/html", "application/xhtml+xml", "application/ld+json"].includes(pageMime)) {
-      throw new Error("This URL did not return a supported public product page.");
+    let html = new TextDecoder("utf-8").decode(fetched.body);
+    if (pageMime === "application/ld+json") html = `<script type="application/ld+json">${html}</script>`;
+    if (looksLikeSupplierRestriction(html)) throw new ImportDiagnosticError("supplier_restriction");
+    product = extractSupplierProduct(html, originalUrl, fetched.url);
+    if (!product.title || (!hasPublicProductMetadata(html, fetched.url) && !product.images.length && !product.price && !product.description && !product.sku && !product.brand)) {
+      throw new ImportDiagnosticError("product_metadata_not_found");
     }
-    const product = parsePage(new TextDecoder("utf-8").decode(fetched.body), fetched.url);
-    if (!product.title) throw new Error("No public product title metadata was found. Enter the product manually instead.");
-    const historyId = await recordImport(supabase, user.id, originalUrl.toString(), fetched.url.hostname, "retrieved", product.title, "");
-    return json({ ...product, source_url: originalUrl.toString(), supplier_host: originalUrl.hostname, history_id: historyId });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Supplier metadata retrieval failed.";
-    const historyId = await recordImport(supabase, user.id, originalUrl.toString(), originalUrl.hostname, "failed", "", message.slice(0, 220));
-    return json({ error: message, history_id: historyId }, 422);
+    retrievalError = error;
+    logImportFailure({ requestId, operation: "metadata", supplierHost: sanitizedSupplierHost(originalUrl), error, elapsedMs: Date.now() - startedAt });
   }
+
+  const diagnostic = retrievalError ? publicImportDiagnostic(retrievalError, requestId) : null;
+  let history: Awaited<ReturnType<typeof recordImport>> | null = null;
+  let historyWarning = "";
+  try {
+    history = await recordImport(supabase, user.id, originalUrl, diagnostic ? "failed" : "retrieved", diagnostic ? "" : product?.title || "", diagnostic?.message.slice(0, 220) || "");
+  } catch (error) {
+    logImportFailure({ requestId, operation: "metadata", supplierHost: sanitizedSupplierHost(originalUrl), error, elapsedMs: Date.now() - startedAt });
+    historyWarning = "This attempt could not be saved to import history. Check the Admin history table and permissions; the result is not recorded.";
+  }
+
+  if (diagnostic) {
+    return json({ error: diagnostic.message, code: diagnostic.code, request_id: requestId, history_id: history?.id || null, history, history_warning: historyWarning || undefined }, 422, responseHeaders);
+  }
+  return json({ ...product, extraction_warning: product && !product.price && !product.images.length && !product.description ? "Only limited public product metadata was available. Missing prices, images and details must be entered manually; they were not inferred." : undefined, request_id: requestId, history_id: history?.id || null, history, history_warning: historyWarning || undefined }, 200, responseHeaders);
 }

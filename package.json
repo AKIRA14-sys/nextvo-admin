@@ -4,7 +4,7 @@
   "description": "Standalone mobile-first NEXTVO Admin dashboard PWA",
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "node scripts/check-runtime.mjs && next build",
     "start": "next start",
     "lint": "eslint src --ext .ts,.tsx",
     "typecheck": "tsc --noEmit",

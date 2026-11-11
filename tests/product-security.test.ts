@@ -84,58 +84,56 @@ test("SSRF filters reject private, loopback, link-local and special-use IPs", ()
 });
 
 test("safe fetch rejects a mixed public/private DNS answer before any HTTP request", async () => {
-  const originalFetch = globalThis.fetch;
   let calls = 0;
-  globalThis.fetch = (async () => { calls += 1; return new Response("ok"); }) as typeof fetch;
+  const fetcher = async () => { calls += 1; return new Response("ok"); };
   try {
     await assert.rejects(
       fetchPublicResource(new URL("https://supplier.example/product"), fetchOptions, async () => [
         { address: "8.8.8.8", family: 4 },
         { address: "127.0.0.1", family: 4 },
-      ]),
-      /exclusively to public/,
+      ], fetcher),
+      /blocked_destination/,
     );
     assert.equal(calls, 0);
   } finally {
-    globalThis.fetch = originalFetch;
+    // Each test owns its injected transport; global fetch is never replaced.
   }
 });
 
 test("safe fetch revalidates redirect destinations and bounds downloaded bodies", async () => {
-  const originalFetch = globalThis.fetch;
   let calls = 0;
-  globalThis.fetch = (async () => {
+  const redirectFetcher = async () => {
     calls += 1;
     return new Response(null, { status: 302, headers: { location: "http://127.0.0.1/admin" } });
-  }) as typeof fetch;
+  };
   try {
     await assert.rejects(
-      fetchPublicResource(new URL("https://supplier.example/product"), fetchOptions, async () => [{ address: "8.8.8.8", family: 4 }]),
-      /public HTTPS|Private and special-use/,
+      fetchPublicResource(new URL("https://supplier.example/product"), fetchOptions, async () => [{ address: "8.8.8.8", family: 4 }], redirectFetcher),
+      /redirect_validation_failure|blocked_destination/,
     );
     assert.equal(calls, 1);
   } finally {
-    globalThis.fetch = originalFetch;
+    // Each test owns its injected transport; global fetch is never replaced.
   }
 
-  globalThis.fetch = (async () => new Response(new Uint8Array(20), { headers: { "Content-Type": "text/html" } })) as typeof fetch;
+  const sizeFetcher = async () => new Response(new Uint8Array(20), { headers: { "Content-Type": "text/html" } });
   try {
     await assert.rejects(
-      fetchPublicResource(new URL("https://supplier.example/product"), { ...fetchOptions, maxBytes: 10 }, async () => [{ address: "8.8.8.8", family: 4 }]),
-      /exceeded the 10-byte safety limit/,
+      fetchPublicResource(new URL("https://supplier.example/product"), { ...fetchOptions, maxBytes: 10 }, async () => [{ address: "8.8.8.8", family: 4 }], sizeFetcher),
+      /response_too_large/,
     );
   } finally {
-    globalThis.fetch = originalFetch;
+    // Each test owns its injected transport; global fetch is never replaced.
   }
 
-  globalThis.fetch = (async () => new Response("not actually html", { headers: { "Content-Type": "text/html-malicious" } })) as typeof fetch;
+  const mimeFetcher = async () => new Response("not actually html", { headers: { "Content-Type": "text/html-malicious" } });
   try {
     await assert.rejects(
-      fetchPublicResource(new URL("https://supplier.example/product"), fetchOptions, async () => [{ address: "8.8.8.8", family: 4 }]),
-      /unsupported content type/,
+      fetchPublicResource(new URL("https://supplier.example/product"), fetchOptions, async () => [{ address: "8.8.8.8", family: 4 }], mimeFetcher),
+      /unsupported_page_format/,
     );
   } finally {
-    globalThis.fetch = originalFetch;
+    // Each test owns its injected transport; global fetch is never replaced.
   }
 });
 

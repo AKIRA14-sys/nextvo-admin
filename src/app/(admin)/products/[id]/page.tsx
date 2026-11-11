@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, ArrowDown, ArrowUp, Check, ImagePlus, Link2, LoaderCircle, Plus, Save, Trash2 } from "lucide-react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { STOREFRONT_URL, SUPABASE_CONFIGURED, SUPABASE_URL } from "@/lib/supabase/config";
@@ -94,6 +94,7 @@ export default function ProductEditorPage() {
   const [originalSearchTerms, setOriginalSearchTerms] = useState<string[]>([]);
   const [externalImagesConfirmed, setExternalImagesConfirmed] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ complete: 0, total: 0 });
+  const savingRef = useRef(false);
 
   const subcategories = useMemo(
     () => categories.find((category) => category.id === form.category_id)?.subcategories?.filter((subcategory) => subcategory.active) || [],
@@ -258,9 +259,11 @@ export default function ProductEditorPage() {
 
   async function save(action: "draft" | "published" | "current", event?: FormEvent) {
     event?.preventDefault();
+    if (savingRef.current) return;
     setError("");
     setSuccess("");
     if (!form.name.trim()) { setError("Product name is required."); return; }
+    if (!form.price.trim()) { setError("Enter a valid NGN selling price."); return; }
     const price = Number(form.price);
     const stock = Number(form.stock);
     const compare = form.compare.trim() ? Number(form.compare) : null;
@@ -282,6 +285,7 @@ export default function ProductEditorPage() {
     if (!slug) { setError("Enter a product name or URL slug that produces a valid slug."); return; }
     if (externalImageCount > 0 && !externalImagesConfirmed) { setError("Confirm that externally hosted image URLs are permitted and may become unavailable, or copy permitted images into Storage."); return; }
 
+    savingRef.current = true;
     setSaving(true);
     let uploadedPaths: string[] = [];
     const db = getSupabaseBrowserClient();
@@ -355,9 +359,7 @@ export default function ProductEditorPage() {
       setOriginalSearchTerms(product.search_terms);
       if (isNew) {
         router.replace(`/products/${savedId}`);
-        router.refresh();
       } else {
-        router.refresh();
         setReloadToken((token) => token + 1);
       }
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -370,6 +372,7 @@ export default function ProductEditorPage() {
         setError(`Save failed; the catalogue was not confirmed updated. ${safeError(caught)}`);
       }
     } finally {
+      savingRef.current = false;
       setSaving(false);
       setUploadProgress({ complete: 0, total: 0 });
     }

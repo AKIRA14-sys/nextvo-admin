@@ -1,12 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { AlertTriangle, ArrowUpRight, Boxes, CircleDollarSign, Package, Plus, RefreshCw, Users } from "lucide-react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { SUPABASE_CONFIGURED } from "@/lib/supabase/config";
 import { formatMoney, safeError } from "@/lib/format";
+import { createRefreshQueue } from "@/lib/refresh-queue";
 
 type Order = { id: string; status: string; payment_status: string; total_amount_ngn: number; created_at: string; customer_name: string; customer_email: string };
 type DailyRevenue = { revenue_date: string; revenue_ngn: number | string };
@@ -17,8 +18,9 @@ type Metrics = { products: number | null; active: number | null; drafts: number 
 const empty: Metrics = { products: null, active: null, drafts: null, categories: null, customers: null, orders: null, pending: null, completed: null, lowStock: null, outStock: null, revenue: null };
 
 export default function DashboardPage() {
-  const [range, setRange] = useState("7 days"); const [customStart, setCustomStart] = useState(() => dateFieldValue(new Date(Date.now()-6*86400000))); const [customEnd, setCustomEnd] = useState(() => dateFieldValue(new Date())); const [metrics, setMetrics] = useState(empty); const [trend, setTrend] = useState<{ date: string; revenue: number }[]>([]); const [recent, setRecent] = useState<Product[]>([]); const [recentOrders, setRecentOrders] = useState<Order[]>([]); const [error, setError] = useState(""); const [loading, setLoading] = useState(true);
+  const [range, setRange] = useState("7 days"); const [customStart, setCustomStart] = useState(() => dateFieldValue(new Date(Date.now()-6*86400000))); const [customEnd, setCustomEnd] = useState(() => dateFieldValue(new Date())); const [metrics, setMetrics] = useState(empty); const [trend, setTrend] = useState<{ date: string; revenue: number }[]>([]); const [recent, setRecent] = useState<Product[]>([]); const [recentOrders, setRecentOrders] = useState<Order[]>([]); const [error, setError] = useState(""); const [loading, setLoading] = useState(true); const loadId = useRef(0);
   const load = useCallback(async () => {
+    const requestId = ++loadId.current;
     if (!SUPABASE_CONFIGURED) { setLoading(false); return; }
     setLoading(true); setError(""); const supabase = getSupabaseBrowserClient();
     try {
@@ -38,6 +40,7 @@ export default function DashboardPage() {
         supabase.from("nextvo_admin_product_details").select("product_id", { count: "exact", head: true }).eq("status", "draft"),
         supabase.from("products").select("id", { count: "exact", head: true }).eq("stock_quantity", 0)
       ]);
+      if (requestId !== loadId.current) return;
       const failures = [prod.error, active.error, cats.error, orders.error, orderTotal.error, pendingOrders.error, completedOrders.error, verifiedRevenue.error, verifiedByDay.error].filter(Boolean);
       if (failures.length) throw failures[0];
       const dailyRows = (verifiedByDay.data || []) as DailyRevenue[]; const chartStart=new Date(start.getFullYear(),start.getMonth(),start.getDate()); const chartEnd=new Date(end.getFullYear(),end.getMonth(),end.getDate()); const chartDays=Math.min(90,Math.max(1,Math.ceil((chartEnd.getTime()-chartStart.getTime())/86400000))); const buckets=new Map<string,number>();
@@ -46,10 +49,27 @@ export default function DashboardPage() {
       setTrend(Array.from(buckets,([date,revenue])=>({date,revenue})));
       setMetrics({products:prod.count??null,active:active.count??null,drafts:drafts.error?null:(drafts.count??0),categories:cats.count??null,customers:customers.error?null:Number(customers.data||0),orders:orderTotal.count??null,pending:pendingOrders.count??null,completed:completedOrders.count??null,lowStock:low.error?null:(low.count??0),outStock:outStock.error?null:(outStock.count??0),revenue:verifiedRevenue.error?null:Number(verifiedRevenue.data||0)});
       setRecentOrders((orders.data||[]) as Order[]);
-      const { data: latest, error: latestError } = await supabase.from("products").select("id,name,active,stock_quantity,price_ngn,created_at,image_url").order("created_at", { ascending: false }).limit(4); if (!latestError) setRecent((latest || []) as Product[]);
-    } catch (e) { setError(safeError(e)); } finally { setLoading(false); }
+      const { data: latest, error: latestError } = await supabase.from("products").select("id,name,active,stock_quantity,price_ngn,created_at,image_url").order("created_at", { ascending: false }).limit(4); if (requestId === loadId.current && !latestError) setRecent((latest || []) as Product[]);
+    } catch (e) { if (requestId === loadId.current) setError(safeError(e)); } finally { if (requestId === loadId.current) setLoading(false); }
   },[range,customStart,customEnd]);
-  useEffect(() => { void load(); if (!SUPABASE_CONFIGURED) return; const client = getSupabaseBrowserClient(); const channel = client.channel("admin-dashboard-live").on("postgres_changes", { event: "*", schema: "public", table: "products" }, () => { void load(); }).on("postgres_changes", { event: "*", schema: "public", table: "orders" }, () => { void load(); }).on("postgres_changes", { event: "*", schema: "public", table: "nextvo_verified_payments" }, () => { void load(); }).subscribe(); return () => { void client.removeChannel(channel); }; }, [load]);
+  const refresh = useMemo(() => createRefreshQueue(load), [load]);
+  useEffect(() => {
+    refresh.activate();
+    void refresh.run();
+    const requestCounter = loadId;
+    if (!SUPABASE_CONFIGURED) return () => refresh.dispose();
+    const client = getSupabaseBrowserClient();
+    const schedule = () => { if (document.visibilityState === "visible") refresh.schedule(); };
+    const channel = client.channel("admin-dashboard-live")
+      .on("postgres_changes", { event: "*", schema: "public", table: "products" }, schedule)
+      .on("postgres_changes", { event: "*", schema: "public", table: "orders" }, schedule)
+      .on("postgres_changes", { event: "*", schema: "public", table: "categories" }, schedule)
+      .on("postgres_changes", { event: "*", schema: "public", table: "nextvo_admin_product_details" }, schedule)
+      .on("postgres_changes", { event: "*", schema: "public", table: "nextvo_verified_payments" }, schedule).subscribe();
+    window.addEventListener("focus", schedule);
+    document.addEventListener("visibilitychange", schedule);
+    return () => { refresh.dispose(); ++requestCounter.current; window.removeEventListener("focus", schedule); document.removeEventListener("visibilitychange", schedule); void client.removeChannel(channel); };
+  }, [refresh]);
   const metricCards = useMemo(() => [
     { label: "Catalogue products", value: metrics.products, note: "All real product rows", icon: Package, color: "" },
     { label: "Published products", value: metrics.active, note: "Visible in the public catalogue", icon: Package, color: "purple" },
@@ -63,7 +83,7 @@ export default function DashboardPage() {
     { label: "Low stock", value: metrics.lowStock, note: "Quantity from 1 to 5", icon: AlertTriangle, color: "amber" },
     { label: "Out of stock", value: metrics.outStock, note: "Quantity equals zero", icon: AlertTriangle, color: "red" }
   ], [metrics]);
-  return <><div className="page-heading"><div><div className="eyebrow">STORE OVERVIEW</div><h1>Good {new Date().getHours() < 12 ? "morning" : new Date().getHours() < 18 ? "afternoon" : "evening"}</h1><p>Here’s what’s happening with your store today.</p></div><div className="actions"><button className="button ghost" onClick={load} disabled={loading}><RefreshCw size={15} />Refresh</button><Link className="button primary" href="/products/new"><Plus size={16} />Add product</Link></div></div>
+  return <><div className="page-heading"><div><div className="eyebrow">STORE OVERVIEW</div><h1>Good {new Date().getHours() < 12 ? "morning" : new Date().getHours() < 18 ? "afternoon" : "evening"}</h1><p>Here’s what’s happening with your store today.</p></div><div className="actions"><button className="button ghost" onClick={() => void refresh.run()} disabled={loading}><RefreshCw size={15} />Refresh</button><Link className="button primary" href="/products/new"><Plus size={16} />Add product</Link></div></div>
     {!SUPABASE_CONFIGURED && <div className="notice warn" style={{ marginBottom: 17 }}><CircleDollarSign size={17} /><div><b>Live store data is not connected.</b> Add the Supabase URL and public key in Vercel; no sample metrics are shown.</div></div>}
     {error && <div className="notice error" style={{ marginBottom: 17 }}><CircleDollarSign size={17} /><div><b>Couldn’t load store data.</b> {error} Check that the admin SQL setup was applied.</div></div>}
     <div className="grid metrics">{metricCards.map((item) => { const Icon = item.icon; return <div key={item.label} className={`card metric-card ${item.color}`}><div className="metric-top"><span>{item.label}</span><span className="metric-icon"><Icon size={17} /></span></div><div className="metric-value">{loading ? "…" : item.value === null ? "—" : item.value}</div><div className="metric-note">{item.note}</div></div>; })}</div>

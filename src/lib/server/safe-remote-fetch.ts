@@ -1,9 +1,11 @@
 import { lookup } from "node:dns/promises";
-import { Agent } from "undici";
+import { Agent, fetch as undiciFetch } from "undici";
 import ipaddr from "ipaddr.js";
+import { classifyNetworkFailure, ImportDiagnosticError } from "./import-diagnostics";
 
 type AddressRecord = { address: string; family: number };
 type AddressResolver = (hostname: string) => Promise<AddressRecord[]>;
+export type SafeFetchTransport = (input: URL, init: RequestInit & { dispatcher: Agent }) => Promise<Response>;
 
 type FetchPublicResourceOptions = {
   maxBytes: number;
@@ -13,6 +15,10 @@ type FetchPublicResourceOptions = {
   userAgent: string;
 };
 
+function normalizeHost(host: string) {
+  return host.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+}
+
 export function isPublicInternetAddress(raw: string): boolean {
   try {
     return ipaddr.parse(raw).range() === "unicast";
@@ -21,24 +27,24 @@ export function isPublicInternetAddress(raw: string): boolean {
   }
 }
 
-export function assertAllowedRemoteUrl(url: URL): string {
+export function assertAllowedRemoteUrl(url: URL, isRedirect = false): string {
   if (url.protocol !== "https:" || url.username || url.password || (url.port && url.port !== "443")) {
-    throw new Error("Only public HTTPS URLs on the standard port can be checked.");
+    throw new ImportDiagnosticError(isRedirect ? "redirect_validation_failure" : "unsupported_protocol");
   }
-  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  const host = normalizeHost(url.hostname);
   if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) {
-    throw new Error("Local and internal network addresses are blocked.");
+    throw new ImportDiagnosticError("blocked_destination");
   }
   if (ipaddr.isValid(host) && !isPublicInternetAddress(host)) {
-    throw new Error("Private and special-use IP addresses are blocked.");
+    throw new ImportDiagnosticError("blocked_destination");
   }
   return host;
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, code: "dns_timeout"): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timer = setTimeout(() => reject(new ImportDiagnosticError(code)), timeoutMs);
     timer.unref?.();
   });
   return Promise.race([promise, timeout]).finally(() => {
@@ -46,35 +52,54 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string)
   });
 }
 
+async function withAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new ImportDiagnosticError("connection_timeout"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 async function resolvePinnedAddress(host: string, remainingMs: number, resolver?: AddressResolver) {
   const doLookup: AddressResolver = resolver ?? (async (hostname) => lookup(hostname, { all: true, verbatim: true }));
-  const records = await withTimeout(
-    doLookup(host),
-    Math.max(1, Math.min(2500, remainingMs)),
-    "Supplier DNS lookup timed out.",
-  );
+  let records: AddressRecord[];
+  try {
+    records = await withTimeout(doLookup(host), Math.max(1, Math.min(2500, remainingMs)), "dns_timeout");
+  } catch (error) {
+    if (error instanceof ImportDiagnosticError) throw error;
+    throw classifyNetworkFailure(error);
+  }
   if (!records.length || records.some((record) => !isPublicInternetAddress(record.address))) {
-    throw new Error("The supplier host did not resolve exclusively to public internet addresses.");
+    throw new ImportDiagnosticError("blocked_destination");
   }
   return records[0];
 }
 
 async function readBoundedBody(response: Response, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> {
   const declaredLength = Number(response.headers.get("content-length") || 0);
-  if (declaredLength > maxBytes) throw new Error(`Supplier response is larger than the ${maxBytes}-byte safety limit.`);
+  if (declaredLength > maxBytes) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new ImportDiagnosticError("response_too_large");
+  }
   const reader = response.body?.getReader();
-  if (!reader) throw new Error("Supplier response had no readable body.");
+  if (!reader) throw new ImportDiagnosticError("unsupported_page_format");
   const chunks: Uint8Array[] = [];
   let total = 0;
   try {
     while (true) {
       signal.throwIfAborted();
-      const { done, value } = await reader.read();
+      const { done, value } = await withAbort(reader.read(), signal);
       if (done) break;
       total += value.byteLength;
       if (total > maxBytes) {
         await reader.cancel();
-        throw new Error(`Supplier response exceeded the ${maxBytes}-byte safety limit.`);
+        throw new ImportDiagnosticError("response_too_large");
       }
       chunks.push(value);
     }
@@ -91,10 +116,18 @@ async function readBoundedBody(response: Response, maxBytes: number, signal: Abo
   return body;
 }
 
+function statusFailure(status: number) {
+  if (status === 403) return new ImportDiagnosticError("http_403", undefined, status);
+  if (status === 404) return new ImportDiagnosticError("http_404", undefined, status);
+  if (status === 429) return new ImportDiagnosticError("http_429", undefined, status);
+  return new ImportDiagnosticError("http_failure", undefined, status);
+}
+
 export async function fetchPublicResource(
   input: URL,
   options: FetchPublicResourceOptions,
   resolver?: AddressResolver,
+  fetcher: SafeFetchTransport = undiciFetch as unknown as SafeFetchTransport,
 ): Promise<{ url: URL; contentType: string; body: Uint8Array }> {
   const deadline = Date.now() + options.timeoutMs;
   let url = new URL(input);
@@ -102,50 +135,67 @@ export async function fetchPublicResource(
 
   for (let hop = 0; hop <= maxRedirects; hop += 1) {
     const remaining = deadline - Date.now();
-    if (remaining <= 0) throw new Error("The supplier request exceeded its overall time limit.");
-    const host = assertAllowedRemoteUrl(url);
+    if (remaining <= 0) throw new ImportDiagnosticError("connection_timeout");
+    const host = assertAllowedRemoteUrl(url, hop > 0);
     const pin = await resolvePinnedAddress(host, remaining, resolver);
     type LookupResult = string | AddressRecord[];
     type LookupCallback = (error: NodeJS.ErrnoException | null, address: LookupResult, family?: number) => void;
     const pinnedLookup = (hostname: string, lookupOptions: { all?: boolean } | undefined, callback: LookupCallback) => {
-      if (hostname.toLowerCase().replace(/\.$/, "") !== host) return callback(new Error("Unexpected DNS lookup host"), "");
+      if (normalizeHost(hostname) !== host) return callback(new Error("Unexpected DNS lookup host"), "");
       if (lookupOptions?.all) return callback(null, [{ address: pin.address, family: pin.family }]);
       callback(null, pin.address, pin.family);
     };
     const dispatcher = new Agent({ connect: { lookup: pinnedLookup as never } });
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(new Error("The supplier request timed out.")), Math.max(1, remaining));
+    const timeout = setTimeout(() => controller.abort(new Error("Supplier request timed out")), Math.max(1, deadline - Date.now()));
     timeout.unref?.();
 
     try {
-      const response = await fetch(url, {
-        redirect: "manual",
-        signal: controller.signal,
-        headers: { "User-Agent": options.userAgent, Accept: options.accept },
-        dispatcher,
-      } as RequestInit & { dispatcher: Agent });
+      let response: Response;
+      try {
+        response = await withAbort(fetcher(url, {
+          redirect: "manual",
+          signal: controller.signal,
+          headers: { "User-Agent": options.userAgent, Accept: options.accept },
+          dispatcher,
+        }), controller.signal);
+      } catch (error) {
+        throw classifyNetworkFailure(error, controller.signal.aborted);
+      }
 
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get("location");
         await response.body?.cancel().catch(() => undefined);
-        if (!location) throw new Error("Supplier page redirected without a safe destination.");
-        if (hop === maxRedirects) throw new Error("Too many redirects. Open the final public page or use manual entry.");
-        url = new URL(location, url);
+        if (!location) throw new ImportDiagnosticError("redirect_validation_failure");
+        if (hop === maxRedirects) throw new ImportDiagnosticError("redirect_limit");
+        try {
+          url = new URL(location, url);
+        } catch (error) {
+          throw new ImportDiagnosticError("redirect_validation_failure", error);
+        }
         continue;
       }
-      if (!response.ok) throw new Error(`Supplier page responded with HTTP ${response.status}.`);
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        throw statusFailure(response.status);
+      }
       const contentType = response.headers.get("content-type") || "";
       const responseMime = contentType.split(";")[0].trim().toLowerCase();
       const acceptedMimes = options.accept.split(",").map((part) => part.trim().split(";")[0].toLowerCase()).filter((part) => part && part !== "*/*");
       if (!acceptedMimes.includes(responseMime)) {
-        throw new Error("Supplier response has an unsupported content type.");
+        await response.body?.cancel().catch(() => undefined);
+        throw new ImportDiagnosticError("unsupported_page_format");
       }
       const body = await readBoundedBody(response, options.maxBytes, controller.signal);
       return { url, contentType, body };
+    } catch (error) {
+      if (error instanceof ImportDiagnosticError) throw error;
+      throw classifyNetworkFailure(error, controller.signal.aborted);
     } finally {
       clearTimeout(timeout);
-      await dispatcher.close().catch(() => undefined);
+      if (controller.signal.aborted) await dispatcher.destroy().catch(() => undefined);
+      else await dispatcher.close().catch(() => undefined);
     }
   }
-  throw new Error("Could not retrieve the public supplier resource.");
+  throw new ImportDiagnosticError("redirect_limit");
 }
