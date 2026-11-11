@@ -1,0 +1,41 @@
+{
+  "name": "nextvo-admin",
+  "version": "0.1.0",
+  "description": "Standalone mobile-first NEXTVO Admin dashboard PWA",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint src --ext .ts,.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "nextvo",
+    "admin",
+    "pwa"
+  ],
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.119.0",
+    "ipaddr.js": "^2.5.0",
+    "lucide-react": "^1.72.0",
+    "next": "15.5",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "recharts": "^3.10.1",
+    "undici": "^8.12.4",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "^15.5.29",
+    "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "postcss": "^8.5.32"
+  }
+}
