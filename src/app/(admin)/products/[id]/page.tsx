@@ -8,11 +8,22 @@ import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { STOREFRONT_URL, SUPABASE_CONFIGURED, SUPABASE_URL } from "@/lib/supabase/config";
 import { mergeProductAttributes, resolveProductStatus, validateSupplierCost } from "@/lib/product-domain";
 import { MAX_PRODUCT_IMAGE_BYTES } from "@/lib/image-validation";
+import { describeImageUploadError, MAX_PRODUCT_IMAGE_SOURCE_BYTES, prepareProductImage } from "@/lib/product-image-processing";
 import { formatMoney, safeError, slugify } from "@/lib/format";
 
 const NEW = "new";
 type Category = { id: string; slug: string; name: string; active: boolean; subcategories?: { id: string; slug: string; name: string; active: boolean }[] };
-type Photo = { url: string; file?: File; alt: string; sourceUrl?: string };
+type Photo = {
+  id: string;
+  url: string;
+  file?: File;
+  alt: string;
+  sourceUrl?: string;
+  uploadPath?: string;
+  uploadedUrl?: string;
+  uploadStatus?: "uploading" | "uploaded" | "failed";
+  uploadError?: string;
+};
 type Variant = { id?: string; label: string; sku: string; price: string; stock: string; options: string };
 type ProductForm = {
   name: string;
@@ -93,8 +104,21 @@ export default function ProductEditorPage() {
   const [originalAttributes, setOriginalAttributes] = useState<Record<string, unknown>>({});
   const [originalSearchTerms, setOriginalSearchTerms] = useState<string[]>([]);
   const [externalImagesConfirmed, setExternalImagesConfirmed] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState({ complete: 0, total: 0 });
+  const [uploadProgress, setUploadProgress] = useState({ complete: 0, total: 0, current: "" });
+  const [retryAction, setRetryAction] = useState<"draft" | "published" | "current" | null>(null);
   const savingRef = useRef(false);
+  const uploadedPathsRef = useRef(new Set<string>());
+  const photosRef = useRef<Photo[]>([]);
+
+  useEffect(() => {
+    photosRef.current = photos;
+  }, [photos]);
+
+  useEffect(() => () => {
+    for (const photo of photosRef.current) {
+      if (photo.url.startsWith("blob:")) URL.revokeObjectURL(photo.url);
+    }
+  }, []);
 
   const subcategories = useMemo(
     () => categories.find((category) => category.id === form.category_id)?.subcategories?.filter((subcategory) => subcategory.active) || [],
@@ -132,8 +156,8 @@ export default function ProductEditorPage() {
       const details = detailsResult.data || {};
       const attrs = (product.attributes && typeof product.attributes === "object" ? product.attributes : {}) as Record<string, unknown>;
       const imageSources = readImageSources(details.source_image_urls);
-      const imageRows = ((imagesResult.data || []) as Array<{ image_url: string; alt_text: string | null }>).map((image) => ({ url: image.image_url, sourceUrl: imageSources.get(image.image_url), alt: image.alt_text || product.name }));
-      if (product.image_url && !imageRows.some((image: Photo) => image.url === product.image_url)) imageRows.unshift({ url: product.image_url, sourceUrl: imageSources.get(product.image_url), alt: product.name });
+      const imageRows = ((imagesResult.data || []) as Array<{ image_url: string; alt_text: string | null }>).map((image) => ({ id: crypto.randomUUID(), url: image.image_url, sourceUrl: imageSources.get(image.image_url), alt: image.alt_text || product.name }));
+      if (product.image_url && !imageRows.some((image: Photo) => image.url === product.image_url)) imageRows.unshift({ id: crypto.randomUUID(), url: product.image_url, sourceUrl: imageSources.get(product.image_url), alt: product.name });
       setPhotos(imageRows);
       setOriginalAttributes(attrs);
       setOriginalSearchTerms(Array.isArray(product.search_terms) ? product.search_terms.map(String) : []);
@@ -180,7 +204,11 @@ export default function ProductEditorPage() {
   function addFiles(event: ChangeEvent<HTMLInputElement>) {
     const selected = Array.from(event.target.files || []);
     const acceptedTypes = ["image/jpeg", "image/png", "image/webp", "image/avif"];
-    const good = selected.filter((file) => acceptedTypes.includes(file.type) && file.size > 0 && file.size <= MAX_PRODUCT_IMAGE_BYTES);
+    const acceptedExtensions = /\.(jpe?g|png|webp|avif)$/i;
+    const good = selected.filter((file) => {
+      const typeCanBeSniffed = !file.type || file.type === "application/octet-stream";
+      return (acceptedTypes.includes(file.type) || (typeCanBeSniffed && acceptedExtensions.test(file.name))) && file.size > 0 && file.size <= MAX_PRODUCT_IMAGE_SOURCE_BYTES;
+    });
     const existingKeys = new Set(photos.filter((photo) => photo.file).map((photo) => `${photo.file?.name}:${photo.file?.size}:${photo.file?.lastModified}`));
     const unique = good.filter((file) => {
       const key = `${file.name}:${file.size}:${file.lastModified}`;
@@ -188,10 +216,11 @@ export default function ProductEditorPage() {
       existingKeys.add(key);
       return true;
     });
-    if (good.length !== selected.length) setError("Use non-empty JPEG, PNG, WebP or AVIF images up to 5 MB each.");
+    if (selected.some((file) => file.size > MAX_PRODUCT_IMAGE_SOURCE_BYTES)) setError("Each source image must be 30 MB or smaller. Images over 5 MB are resized in the browser when possible.");
+    else if (good.length !== selected.length) setError("Use non-empty JPEG, PNG, WebP or AVIF images. Images over 5 MB will be resized before upload when possible.");
     else if (unique.length !== good.length) setError("Duplicate file selections were skipped.");
     else setError("");
-    setPhotos((previous) => [...previous, ...unique.map((file) => ({ url: URL.createObjectURL(file), file, alt: form.name || file.name }))]);
+    setPhotos((previous) => [...previous, ...unique.map((file) => ({ id: crypto.randomUUID(), url: URL.createObjectURL(file), file, alt: form.name || file.name }))]);
     setFileInputKey((key) => key + 1);
   }
 
@@ -205,12 +234,20 @@ export default function ProductEditorPage() {
     });
   }
 
-  function removePhoto(index: number) {
-    setPhotos((items) => {
-      const removed = items[index];
-      if (removed?.file) URL.revokeObjectURL(removed.url);
-      return items.filter((_, itemIndex) => itemIndex !== index);
-    });
+  async function removePhoto(index: number) {
+    const removed = photos[index];
+    if (!removed) return;
+    if (removed.uploadPath) {
+      const { error: removeError } = await getSupabaseBrowserClient().storage.from("product-images").remove([removed.uploadPath]);
+      if (removeError) {
+        setError(`Could not remove the temporary image. ${describeImageUploadError(removeError)}`);
+        return;
+      }
+      uploadedPathsRef.current.delete(removed.uploadPath);
+    }
+    if (removed.url.startsWith("blob:")) URL.revokeObjectURL(removed.url);
+    setPhotos((items) => items.filter((photo) => photo.id !== removed.id));
+    setError("");
   }
 
   function addUrl() {
@@ -218,7 +255,7 @@ export default function ProductEditorPage() {
       const imageUrl = new URL(urlInput.trim());
       if (imageUrl.protocol !== "https:" || imageUrl.username || imageUrl.password) throw new Error();
       if (photos.some((photo) => photo.url === imageUrl.toString())) { setError("That image URL is already in the product gallery."); return; }
-      setPhotos((previous) => [...previous, { url: imageUrl.toString(), alt: form.name }]);
+      setPhotos((previous) => [...previous, { id: crypto.randomUUID(), url: imageUrl.toString(), alt: form.name }]);
       setUrlInput("");
       setError("");
       setExternalImagesConfirmed(false);
@@ -229,32 +266,60 @@ export default function ProductEditorPage() {
 
   async function uploadFiles() {
     const db = getSupabaseBrowserClient();
-    const { data: { user } } = await db.auth.getUser();
-    if (!user) throw new Error("Sign in is required to upload product images.");
-    const filePhotos = photos.filter((photo) => photo.file);
+    const { data: { user }, error: authError } = await db.auth.getUser();
+    if (authError) throw new Error(`Could not verify the administrator sign-in. ${describeImageUploadError(authError)}`);
+    if (!user) throw new Error("Your administrator sign-in is missing or expired. Sign in again, then retry; the form and selected images are kept.");
+    const filePhotos = photos.filter((photo) => photo.file && !photo.uploadedUrl);
     const output: Photo[] = [];
-    const uploadedPaths: string[] = [];
-    setUploadProgress({ complete: 0, total: filePhotos.length });
+    setUploadProgress({ complete: 0, total: filePhotos.length, current: "" });
     let complete = 0;
     for (const photo of photos) {
-      if (!photo.file) { output.push(photo); continue; }
-      const extension = photo.file.name.split(".").pop()?.toLowerCase() || "webp";
-      const path = `${user.id}/${crypto.randomUUID()}.${extension}`;
-      const { error: uploadError } = await db.storage.from("product-images").upload(path, photo.file, {
-        upsert: false,
-        cacheControl: "31536000",
-        contentType: photo.file.type,
-      });
-      if (uploadError) {
-        throw new Error(`Image upload failed for ${photo.file.name}. Check the product-images bucket, file type and 5 MB limit. ${safeError(uploadError)}`);
+      const selectedFile = photo.file;
+      if (!selectedFile) { output.push(photo); continue; }
+      if (photo.uploadedUrl) {
+        output.push({ ...photo, url: photo.uploadedUrl, file: undefined });
+        continue;
       }
-      uploadedPaths.push(path);
-      const { data } = db.storage.from("product-images").getPublicUrl(path);
-      output.push({ ...photo, url: data.publicUrl, file: undefined });
-      complete += 1;
-      setUploadProgress({ complete, total: filePhotos.length });
+      setUploadProgress({ complete, total: filePhotos.length, current: selectedFile.name });
+      try {
+        const prepared = await prepareProductImage(selectedFile);
+        const extension = prepared.name.split(".").pop()?.toLowerCase() || "webp";
+        const path = photo.uploadPath || `${user.id}/${photo.id}.${extension}`;
+        uploadedPathsRef.current.add(path);
+        setPhotos((current) => current.map((item) => item.id === photo.id
+          ? { ...item, uploadPath: path, uploadStatus: "uploading", uploadError: undefined }
+          : item));
+        const { error: uploadError } = await db.storage.from("product-images").upload(path, prepared, {
+          upsert: false,
+          cacheControl: "31536000",
+          contentType: prepared.type,
+        });
+        if (uploadError) {
+          const duplicate = Number((uploadError as { statusCode?: unknown }).statusCode) === 409 || /already exists|duplicate/i.test(safeError(uploadError));
+          if (duplicate) {
+            // Reuse a stable path when a previous request stored the object but its response was lost.
+            const { data: existing, error: verifyError } = await db.storage.from("product-images").download(path);
+            if (verifyError || !existing) throw uploadError;
+          } else {
+            throw uploadError;
+          }
+        }
+        const { data } = db.storage.from("product-images").getPublicUrl(path);
+        output.push({ ...photo, url: data.publicUrl, file: undefined, uploadPath: path, uploadedUrl: data.publicUrl, uploadStatus: "uploaded", uploadError: undefined });
+        setPhotos((current) => current.map((item) => item.id === photo.id
+          ? { ...item, uploadPath: path, uploadedUrl: data.publicUrl, uploadStatus: "uploaded", uploadError: undefined }
+          : item));
+        complete += 1;
+        setUploadProgress({ complete, total: filePhotos.length, current: "" });
+      } catch (caught) {
+        const reason = describeImageUploadError(caught);
+        setPhotos((current) => current.map((item) => item.id === photo.id
+          ? { ...item, uploadStatus: "failed", uploadError: reason }
+          : item));
+        throw new Error(`Image “${selectedFile.name}” failed: ${reason}`);
+      }
     }
-    return { photos: output, uploadedPaths };
+    return { photos: output };
   }
 
   async function save(action: "draft" | "published" | "current", event?: FormEvent) {
@@ -285,18 +350,20 @@ export default function ProductEditorPage() {
     if (!slug) { setError("Enter a product name or URL slug that produces a valid slug."); return; }
     if (externalImageCount > 0 && !externalImagesConfirmed) { setError("Confirm that externally hosted image URLs are permitted and may become unavailable, or copy permitted images into Storage."); return; }
 
+    setRetryAction(action);
     savingRef.current = true;
     setSaving(true);
-    let uploadedPaths: string[] = [];
+    let phase: "before-upload" | "uploading" | "ready-to-save" | "saving" | "save-response" = "before-upload";
     const db = getSupabaseBrowserClient();
     try {
       const { data: duplicate, error: slugCheckError } = await db.from("products").select("id,name").eq("slug", slug).neq("id", isNew ? "00000000-0000-0000-0000-000000000000" : id).maybeSingle();
       if (slugCheckError) throw new Error(`Could not confirm slug uniqueness; no changes were saved. ${safeError(slugCheckError)}`);
       if (duplicate) { setError(`That product URL slug is already used by “${duplicate.name}”. Choose another slug.`); return; }
 
+      phase = "uploading";
       const uploaded = await uploadFiles();
-      uploadedPaths = uploaded.uploadedPaths;
-      setUploadProgress({ complete: 0, total: 0 });
+      phase = "ready-to-save";
+      setUploadProgress({ complete: 0, total: 0, current: "" });
       const product = {
         ...(isNew ? {} : { id }),
         slug,
@@ -341,18 +408,34 @@ export default function ProductEditorPage() {
         };
       });
 
+      phase = "saving";
       const { data: savedId, error: saveError } = await db.rpc("nextvo_admin_save_product", {
         p_product: product,
         p_private: privateData,
         p_images: imageRows,
         p_variants: variants,
       });
+      phase = "save-response";
       if (saveError) {
         if (saveError.code === "23505") throw new Error("That product URL slug is already in use. Choose a unique slug.");
         throw saveError;
       }
       if (!savedId) throw new Error("The database did not return a saved product ID.");
-      uploadedPaths = [];
+      uploadedPathsRef.current.clear();
+      for (const photo of photosRef.current) {
+        if (photo.url.startsWith("blob:")) URL.revokeObjectURL(photo.url);
+      }
+      const savedPhotos = uploaded.photos.map((photo) => ({
+        ...photo,
+        file: undefined,
+        uploadPath: undefined,
+        uploadedUrl: undefined,
+        uploadStatus: undefined,
+        uploadError: undefined,
+      }));
+      photosRef.current = savedPhotos;
+      setPhotos(savedPhotos);
+      setRetryAction(null);
       setSuccess(chosenStatus === "published" ? "Product saved and marked published in the shared catalogue." : chosenStatus === "draft" ? "Product saved as a draft in the shared catalogue." : `Product changes saved. Current status: ${chosenStatus}.`);
       setForm((current) => ({ ...current, status: chosenStatus }));
       setOriginalAttributes(product.attributes);
@@ -364,17 +447,31 @@ export default function ProductEditorPage() {
       }
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (caught) {
-      if (uploadedPaths.length) {
-        const { error: cleanupError } = await db.storage.from("product-images").remove(uploadedPaths);
-        if (cleanupError) setError(`Save failed and uploaded image cleanup needs attention: ${safeError(cleanupError)}. ${safeError(caught)}`);
-        else setError(`Save failed; the catalogue was not confirmed updated. Uploaded temporary images were removed. ${safeError(caught)}`);
+      if (phase === "ready-to-save" || phase === "save-response") {
+        const uploadedPaths = [...uploadedPathsRef.current];
+        if (uploadedPaths.length) {
+          const { error: cleanupError } = await db.storage.from("product-images").remove(uploadedPaths);
+          if (cleanupError) {
+            setError(`Save failed; temporary image cleanup needs attention. ${describeImageUploadError(cleanupError)} ${safeError(caught)}`);
+          } else {
+            uploadedPathsRef.current.clear();
+            setPhotos((current) => current.map((photo) => uploadedPaths.includes(photo.uploadPath || "")
+              ? { ...photo, uploadPath: undefined, uploadedUrl: undefined, uploadStatus: undefined, uploadError: undefined }
+              : photo));
+            setError(`Save failed; no catalogue change was confirmed. Temporary uploads were removed, and the selected images and product details are still in the form. ${safeError(caught)}`);
+          }
+        } else {
+          setError(`Save failed; no catalogue change was confirmed. Your product details and selected images are still in the form. ${safeError(caught)}`);
+        }
+      } else if (phase === "saving") {
+        setError(`The database did not confirm the save. The form and uploaded images were kept so you can retry without re-uploading. ${safeError(caught)}`);
       } else {
-        setError(`Save failed; the catalogue was not confirmed updated. ${safeError(caught)}`);
+        setError(`Save failed. Your product details and selected images are still in the form. ${safeError(caught)}`);
       }
     } finally {
       savingRef.current = false;
       setSaving(false);
-      setUploadProgress({ complete: 0, total: 0 });
+      setUploadProgress({ complete: 0, total: 0, current: "" });
     }
   }
 
@@ -402,8 +499,8 @@ export default function ProductEditorPage() {
               <div className="field"><label htmlFor="product-subcategory">Subcategory</label><select id="product-subcategory" className="select" value={form.subcategory_id} onChange={(event) => change("subcategory_id", event.target.value)} disabled={!subcategories.length}><option value="">No subcategory</option>{subcategories.map((subcategory) => <option key={subcategory.id} value={subcategory.id}>{subcategory.name}</option>)}</select></div>
               <div className="field"><label htmlFor="product-brand">Brand (optional)</label><input id="product-brand" className="input" value={form.brand} onChange={(event) => change("brand", event.target.value)} placeholder="Brand" /></div>
               <div className="field"><label htmlFor="product-sku">SKU (internal / per variant)</label><input id="product-sku" className="input" value={variantList[0]?.sku || ""} onChange={(event) => setVariantList((variants) => variants.length ? variants.map((variant, index) => index === 0 ? { ...variant, sku: event.target.value } : variant) : [{ ...blankVariant, label: "Default", sku: event.target.value, stock: form.stock }])} placeholder="Optional SKU" /><span className="field-note">Stored on the default variant; not exposed with supplier cost.</span></div>
-              <div className="field"><label htmlFor="selling-price">Selling price (NGN) *</label><input id="selling-price" className="input" type="number" min="0" step="0.01" required value={form.price} onChange={(event) => change("price", event.target.value)} placeholder="0.00" /></div>
-              <div className="field"><label htmlFor="compare-price">Regular / compare-at price (NGN)</label><input id="compare-price" className="input" type="number" min="0" step="0.01" value={form.compare} onChange={(event) => change("compare", event.target.value)} placeholder="Optional original price" /><span className="field-note">Stored and displayed as NGN; the storefront crosses it out when applicable.</span></div>
+              <div className="field"><label htmlFor="selling-price">Selling price (NGN) *</label><input id="selling-price" className="input" type="number" min="0" step="0.01" required value={form.price} onChange={(event) => change("price", event.target.value)} placeholder="0.00" /><span className="field-note">This is the current price customers pay; it is saved to products.price_ngn.</span></div>
+              <div className="field"><label htmlFor="compare-price">Different From price (original, NGN)</label><input id="compare-price" className="input" type="number" min="0" step="0.01" value={form.compare} onChange={(event) => change("compare", event.target.value)} placeholder="Optional original price" /><span className="field-note">Saved to products.compare_at_price_ngn; not the customer charge. Leave blank to show only Selling price. It is crossed out only when higher than Selling price.</span></div>
               <div className="field"><label htmlFor="product-stock">Stock quantity *</label><input id="product-stock" className="input" type="number" min="0" step="1" value={form.stock} onChange={(event) => change("stock", event.target.value)} /></div>
               <div className="field"><label htmlFor="product-status">Publishing status</label><select id="product-status" className="select" value={form.status} onChange={(event) => change("status", event.target.value)}><option value="draft">Draft</option><option value="published">Published</option><option value="unpublished">Unpublished</option><option value="unavailable">Unavailable</option></select><span className="field-note">Save changes preserves this selection. Save draft always sets Draft; Publish always sets Published. Only Published sets products.active=true.</span></div>
             </div>
@@ -411,20 +508,23 @@ export default function ProductEditorPage() {
           </section>
 
           <section className="card">
-            <div className="section-title"><h2>Product photos</h2><span className="tag">Use images you’re permitted to publish · up to 5 MB</span></div>
-            <label className="select-photo"><ImagePlus size={25}/><b>Tap to add product photos</b><span className="tag">JPEG, PNG, WebP or AVIF</span><input key={fileInputKey} type="file" accept="image/jpeg,image/png,image/webp,image/avif" multiple onChange={addFiles} style={{ display: "none" }} /></label>
-            <div className="actions" style={{ marginTop: 10 }}><input className="input" value={urlInput} onChange={(event) => setUrlInput(event.target.value)} placeholder="Add a public HTTPS image URL" /><button className="button" type="button" onClick={addUrl}><Link2 size={14}/>Add URL</button></div>
+            <div className="section-title"><h2>Product photos</h2><span className="tag">Use permitted images · 5 MB max after resizing</span></div>
+            <label className="select-photo"><ImagePlus size={25}/><b>Tap to add product photos</b><span className="tag">JPEG, PNG, WebP or AVIF · large phone photos resize on upload</span><input key={fileInputKey} type="file" accept="image/jpeg,image/png,image/webp,image/avif" multiple onChange={addFiles} disabled={saving} style={{ display: "none" }} /></label>
+            <div className="actions" style={{ marginTop: 10 }}><input className="input" value={urlInput} onChange={(event) => setUrlInput(event.target.value)} placeholder="Add a public HTTPS image URL" disabled={saving} /><button className="button" type="button" onClick={addUrl} disabled={saving}><Link2 size={14}/>Add URL</button></div>
             {externalImageCount > 0 && <div className="notice warn" style={{ marginTop: 10 }}><Link2 size={15}/><span>{externalImageCount} image{externalImageCount === 1 ? " is" : "s are"} still hosted outside NEXTVO Storage and may disappear if the source URL changes. Copy permitted images into Storage using Import, or confirm this external source is permitted and that you understand the availability risk.</span></div>}
             {externalImageCount > 0 && <label className="checkbox" style={{ marginTop: 9 }}><input type="checkbox" checked={externalImagesConfirmed} onChange={(event) => setExternalImagesConfirmed(event.target.checked)} /> I have permission to use these external image URLs and understand they depend on the source website.</label>}
             <div className="photo-strip" style={{ marginTop: 13 }}>
-              {photos.map((photo, index) => <div className="photo-tile" key={`${photo.url}-${index}`}>
+              {photos.map((photo, index) => <div className="photo-tile" key={photo.id}>
                 <img src={photo.url} alt={photo.alt}/>
                 <span style={{ position: "absolute", left: 4, top: 4, padding: "2px 4px", background: "#080b12d9", borderRadius: 5, fontSize: 8 }}>{index === 0 ? "MAIN" : index + 1}{photo.file ? " · NEW" : ""}</span>
+                {photo.file && <span role="status" style={{ position: "absolute", left: 4, right: 4, top: 23, padding: "3px 5px", background: photo.uploadStatus === "failed" ? "#8d2d36e8" : photo.uploadStatus === "uploaded" ? "#17694de8" : "#080b12d9", borderRadius: 5, color: "#fff", fontSize: 9, textAlign: "center" }}>{photo.uploadStatus === "uploading" ? "Uploading…" : photo.uploadStatus === "uploaded" ? "Uploaded · ready to save" : photo.uploadStatus === "failed" ? "Failed · retry available" : photo.file.size > MAX_PRODUCT_IMAGE_BYTES ? "Will resize before upload" : "Ready to upload"}</span>}
                 {photo.sourceUrl && <a href={photo.sourceUrl} target="_blank" rel="noreferrer" title={photo.sourceUrl} aria-label={`Open original image source for photo ${index + 1}`} style={{ position: "absolute", left: 4, bottom: 38, padding: "3px 5px", background: "#080b12d9", borderRadius: 5, color: "#d7e5ff", fontSize: 9 }}>SOURCE</a>}
-                <div className="photo-actions"><button type="button" onClick={() => movePhoto(index, -1)} aria-label="Move photo up"><ArrowUp size={12}/></button><button type="button" onClick={() => movePhoto(index, 1)} aria-label="Move photo down"><ArrowDown size={12}/></button><button type="button" onClick={() => removePhoto(index)} aria-label="Remove photo"><Trash2 size={12}/></button></div>
+                <div className="photo-actions"><button type="button" onClick={() => movePhoto(index, -1)} aria-label="Move photo up" disabled={saving}><ArrowUp size={12}/></button><button type="button" onClick={() => movePhoto(index, 1)} aria-label="Move photo down" disabled={saving}><ArrowDown size={12}/></button><button type="button" onClick={() => void removePhoto(index)} aria-label="Remove photo" disabled={saving}><Trash2 size={12}/></button></div>
               </div>)}
             </div>
-            {uploadProgress.total > 0 && <div role="status" className="helper" style={{ marginTop: 10 }}><LoaderCircle size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />Uploading image {uploadProgress.complete + 1} of {uploadProgress.total} to the product-images bucket…</div>}
+            {photos.filter((photo) => photo.uploadError).map((photo) => <p key={`${photo.id}-error`} role="alert" className="field-note" style={{ color: "#ffb1b1", marginTop: 8 }}>{photo.file?.name}: {photo.uploadError}</p>)}
+            {uploadProgress.total > 0 && <div role="status" className="helper" style={{ marginTop: 10 }}><LoaderCircle size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />Uploading image {uploadProgress.complete + 1} of {uploadProgress.total}{uploadProgress.current ? `: ${uploadProgress.current}` : ""}…</div>}
+            {!saving && retryAction && photos.some((photo) => photo.uploadStatus === "failed") && <button className="button ghost" type="button" style={{ marginTop: 10 }} onClick={() => void save(retryAction)}><ImagePlus size={14}/>Retry failed image uploads</button>}
           </section>
 
           <section className="card">
