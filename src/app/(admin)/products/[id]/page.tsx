@@ -3,12 +3,12 @@
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, ArrowDown, ArrowUp, Check, ImagePlus, Link2, LoaderCircle, Plus, Save, Trash2 } from "lucide-react";
+import { ArrowLeft, ArrowDown, ArrowUp, Check, Crop, ImagePlus, Link2, LoaderCircle, Plus, Save, Trash2 } from "lucide-react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { STOREFRONT_URL, SUPABASE_CONFIGURED, SUPABASE_URL } from "@/lib/supabase/config";
 import { mergeProductAttributes, resolveProductStatus, validateSupplierCost } from "@/lib/product-domain";
 import { MAX_PRODUCT_IMAGE_BYTES } from "@/lib/image-validation";
-import { describeImageUploadError, MAX_PRODUCT_IMAGE_SOURCE_BYTES, prepareProductImage } from "@/lib/product-image-processing";
+import { describeImageUploadError, isProductCardImageUrl, MAX_PRODUCT_IMAGE_SOURCE_BYTES, prepareProductImages, PRODUCT_CARD_IMAGE_SUFFIX } from "@/lib/product-image-processing";
 import { formatMoney, safeError, slugify } from "@/lib/format";
 
 const NEW = "new";
@@ -19,8 +19,13 @@ type Photo = {
   file?: File;
   alt: string;
   sourceUrl?: string;
+  cardUrl?: string;
   uploadPath?: string;
   uploadedUrl?: string;
+  cardUploadPath?: string;
+  cardUploadedUrl?: string;
+  cropX?: number;
+  cropY?: number;
   uploadStatus?: "uploading" | "uploaded" | "failed";
   uploadError?: string;
 };
@@ -66,19 +71,28 @@ function isManagedStorageUrl(value: string) {
   }
 }
 
-function readImageSources(value: unknown): Map<string, string> {
-  const sources = new Map<string, string>();
+type ImageMetadata = { sourceUrl?: string; cardUrl?: string };
+
+function readImageSources(value: unknown): Map<string, ImageMetadata> {
+  const sources = new Map<string, ImageMetadata>();
   if (!Array.isArray(value)) return sources;
   for (const item of value) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const entry = item as Record<string, unknown>;
-    if (typeof entry.image_url !== "string" || typeof entry.source_url !== "string") continue;
+    if (typeof entry.image_url !== "string") continue;
     try {
       const image = new URL(entry.image_url);
-      const source = new URL(entry.source_url);
-      if (image.protocol === "https:" && source.protocol === "https:" && !source.username && !source.password) {
-        sources.set(image.toString(), source.toString());
+      if (image.protocol !== "https:") continue;
+      const metadata: ImageMetadata = {};
+      if (typeof entry.source_url === "string") {
+        const source = new URL(entry.source_url);
+        if (source.protocol === "https:" && !source.username && !source.password) metadata.sourceUrl = source.toString();
       }
+      if (typeof entry.card_image_url === "string") {
+        const card = new URL(entry.card_image_url);
+        if (card.protocol === "https:" && !card.username && !card.password) metadata.cardUrl = card.toString();
+      }
+      if (metadata.sourceUrl || metadata.cardUrl) sources.set(image.toString(), metadata);
     } catch { /* malformed private source metadata is ignored */ }
   }
   return sources;
@@ -97,6 +111,7 @@ export default function ProductEditorPage() {
   const [categories, setCategories] = useState<Category[]>([]);
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [fileInputKey, setFileInputKey] = useState(0);
+  const [cropPhotoId, setCropPhotoId] = useState<string | null>(null);
   const [specifications, setSpecifications] = useState("");
   const [variantList, setVariantList] = useState<Variant[]>([]);
   const [urlInput, setUrlInput] = useState("");
@@ -106,6 +121,7 @@ export default function ProductEditorPage() {
   const [externalImagesConfirmed, setExternalImagesConfirmed] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ complete: 0, total: 0, current: "" });
   const [retryAction, setRetryAction] = useState<"draft" | "published" | "current" | null>(null);
+  const [saveOutcomeUncertain, setSaveOutcomeUncertain] = useState(false);
   const savingRef = useRef(false);
   const uploadedPathsRef = useRef(new Set<string>());
   const photosRef = useRef<Photo[]>([]);
@@ -125,6 +141,7 @@ export default function ProductEditorPage() {
     [categories, form.category_id],
   );
   const externalImageCount = photos.filter((photo) => !isManagedStorageUrl(photo.url) && !photo.file).length;
+  const cropPhoto = photos.find((photo) => photo.id === cropPhotoId && photo.file);
 
   useEffect(() => {
     let live = true;
@@ -156,9 +173,21 @@ export default function ProductEditorPage() {
       const details = detailsResult.data || {};
       const attrs = (product.attributes && typeof product.attributes === "object" ? product.attributes : {}) as Record<string, unknown>;
       const imageSources = readImageSources(details.source_image_urls);
-      const imageRows = ((imagesResult.data || []) as Array<{ image_url: string; alt_text: string | null }>).map((image) => ({ id: crypto.randomUUID(), url: image.image_url, sourceUrl: imageSources.get(image.image_url), alt: image.alt_text || product.name }));
-      if (product.image_url && !imageRows.some((image: Photo) => image.url === product.image_url)) imageRows.unshift({ id: crypto.randomUUID(), url: product.image_url, sourceUrl: imageSources.get(product.image_url), alt: product.name });
+      const imageRows = ((imagesResult.data || []) as Array<{ image_url: string; alt_text: string | null }>)
+        .filter((image) => !isProductCardImageUrl(image.image_url))
+        .map((image) => {
+        const metadata = imageSources.get(image.image_url);
+        return { id: crypto.randomUUID(), url: image.image_url, sourceUrl: metadata?.sourceUrl, cardUrl: metadata?.cardUrl, alt: image.alt_text || product.name };
+      });
+      if (product.image_url && isProductCardImageUrl(product.image_url)) {
+        if (imageRows[0]) imageRows[0].cardUrl = product.image_url;
+        else imageRows.push({ id: crypto.randomUUID(), url: product.image_url, cardUrl: product.image_url, alt: product.name });
+      } else if (product.image_url && !imageRows.some((image: Photo) => image.url === product.image_url)) {
+        const metadata = imageSources.get(product.image_url);
+        imageRows.unshift({ id: crypto.randomUUID(), url: product.image_url, sourceUrl: metadata?.sourceUrl, cardUrl: metadata?.cardUrl, alt: product.name });
+      }
       setPhotos(imageRows);
+      setCropPhotoId(null);
       setOriginalAttributes(attrs);
       setOriginalSearchTerms(Array.isArray(product.search_terms) ? product.search_terms.map(String) : []);
       setExternalImagesConfirmed(false);
@@ -220,7 +249,7 @@ export default function ProductEditorPage() {
     else if (good.length !== selected.length) setError("Use non-empty JPEG, PNG, WebP or AVIF images. Images over 5 MB will be resized before upload when possible.");
     else if (unique.length !== good.length) setError("Duplicate file selections were skipped.");
     else setError("");
-    setPhotos((previous) => [...previous, ...unique.map((file) => ({ id: crypto.randomUUID(), url: URL.createObjectURL(file), file, alt: form.name || file.name }))]);
+    setPhotos((previous) => [...previous, ...unique.map((file) => ({ id: crypto.randomUUID(), url: URL.createObjectURL(file), file, alt: form.name || file.name, cropX: 0.5, cropY: 0.5 }))]);
     setFileInputKey((key) => key + 1);
   }
 
@@ -237,16 +266,22 @@ export default function ProductEditorPage() {
   async function removePhoto(index: number) {
     const removed = photos[index];
     if (!removed) return;
-    if (removed.uploadPath) {
-      const { error: removeError } = await getSupabaseBrowserClient().storage.from("product-images").remove([removed.uploadPath]);
+    if (saveOutcomeUncertain && (removed.uploadPath || removed.cardUploadPath)) {
+      setError("This upload may already be referenced by a save without a confirmed response. Check the product record or retry the save before removing this image.");
+      return;
+    }
+    const uploadedPaths = [removed.uploadPath, removed.cardUploadPath].filter((path): path is string => Boolean(path));
+    if (uploadedPaths.length) {
+      const { error: removeError } = await getSupabaseBrowserClient().storage.from("product-images").remove(uploadedPaths);
       if (removeError) {
         setError(`Could not remove the temporary image. ${describeImageUploadError(removeError)}`);
         return;
       }
-      uploadedPathsRef.current.delete(removed.uploadPath);
+      for (const path of uploadedPaths) uploadedPathsRef.current.delete(path);
     }
     if (removed.url.startsWith("blob:")) URL.revokeObjectURL(removed.url);
     setPhotos((items) => items.filter((photo) => photo.id !== removed.id));
+    if (cropPhotoId === removed.id) setCropPhotoId(null);
     setError("");
   }
 
@@ -269,45 +304,68 @@ export default function ProductEditorPage() {
     const { data: { user }, error: authError } = await db.auth.getUser();
     if (authError) throw new Error(`Could not verify the administrator sign-in. ${describeImageUploadError(authError)}`);
     if (!user) throw new Error("Your administrator sign-in is missing or expired. Sign in again, then retry; the form and selected images are kept.");
-    const filePhotos = photos.filter((photo) => photo.file && !photo.uploadedUrl);
+    const filePhotos = photos.filter((photo) => photo.file);
     const output: Photo[] = [];
     setUploadProgress({ complete: 0, total: filePhotos.length, current: "" });
     let complete = 0;
+
+    async function uploadAsset(path: string, file: File): Promise<string> {
+      uploadedPathsRef.current.add(path);
+      const { error: uploadError } = await db.storage.from("product-images").upload(path, file, {
+        upsert: false,
+        cacheControl: "31536000",
+        contentType: file.type,
+      });
+      if (uploadError) {
+        const duplicate = Number((uploadError as { statusCode?: unknown }).statusCode) === 409 || /already exists|duplicate/i.test(safeError(uploadError));
+        if (duplicate) {
+          // Reuse a stable path when a previous request stored the object but its response was lost.
+          const { data: existing, error: verifyError } = await db.storage.from("product-images").download(path);
+          if (verifyError || !existing) throw uploadError;
+        } else {
+          throw uploadError;
+        }
+      }
+      return db.storage.from("product-images").getPublicUrl(path).data.publicUrl;
+    }
+
     for (const photo of photos) {
       const selectedFile = photo.file;
       if (!selectedFile) { output.push(photo); continue; }
-      if (photo.uploadedUrl) {
-        output.push({ ...photo, url: photo.uploadedUrl, file: undefined });
+      if (photo.uploadedUrl && photo.cardUploadedUrl) {
+        output.push({ ...photo, url: photo.uploadedUrl, cardUrl: photo.cardUploadedUrl, file: undefined });
+        complete += 1;
+        setUploadProgress({ complete, total: filePhotos.length, current: "" });
         continue;
       }
       setUploadProgress({ complete, total: filePhotos.length, current: selectedFile.name });
       try {
-        const prepared = await prepareProductImage(selectedFile);
-        const extension = prepared.name.split(".").pop()?.toLowerCase() || "webp";
-        const path = photo.uploadPath || `${user.id}/${photo.id}.${extension}`;
-        uploadedPathsRef.current.add(path);
-        setPhotos((current) => current.map((item) => item.id === photo.id
-          ? { ...item, uploadPath: path, uploadStatus: "uploading", uploadError: undefined }
-          : item));
-        const { error: uploadError } = await db.storage.from("product-images").upload(path, prepared, {
-          upsert: false,
-          cacheControl: "31536000",
-          contentType: prepared.type,
-        });
-        if (uploadError) {
-          const duplicate = Number((uploadError as { statusCode?: unknown }).statusCode) === 409 || /already exists|duplicate/i.test(safeError(uploadError));
-          if (duplicate) {
-            // Reuse a stable path when a previous request stored the object but its response was lost.
-            const { data: existing, error: verifyError } = await db.storage.from("product-images").download(path);
-            if (verifyError || !existing) throw uploadError;
-          } else {
-            throw uploadError;
-          }
+        const prepared = await prepareProductImages(selectedFile, { x: photo.cropX ?? 0.5, y: photo.cropY ?? 0.5 });
+        const originalExtension = prepared.original.name.split(".").pop()?.toLowerCase() || "webp";
+        const cardExtension = prepared.card.name.split(".").pop()?.toLowerCase() || "webp";
+        const originalPath = photo.uploadPath || `${user.id}/${photo.id}-original.${originalExtension}`;
+        const cardPath = photo.cardUploadPath || `${user.id}/${photo.id}${PRODUCT_CARD_IMAGE_SUFFIX}.${cardExtension}`;
+        let originalUrl = photo.uploadedUrl;
+        if (!originalUrl) {
+          setPhotos((current) => current.map((item) => item.id === photo.id
+            ? { ...item, uploadPath: originalPath, uploadStatus: "uploading", uploadError: undefined }
+            : item));
+          originalUrl = await uploadAsset(originalPath, prepared.original);
+          setPhotos((current) => current.map((item) => item.id === photo.id
+            ? { ...item, uploadPath: originalPath, uploadedUrl: originalUrl, uploadStatus: "uploading" }
+            : item));
         }
-        const { data } = db.storage.from("product-images").getPublicUrl(path);
-        output.push({ ...photo, url: data.publicUrl, file: undefined, uploadPath: path, uploadedUrl: data.publicUrl, uploadStatus: "uploaded", uploadError: undefined });
+
+        let cardUrl = photo.cardUploadedUrl;
+        if (!cardUrl) {
+          setPhotos((current) => current.map((item) => item.id === photo.id
+            ? { ...item, uploadPath: originalPath, uploadedUrl: originalUrl, cardUploadPath: cardPath, uploadStatus: "uploading", uploadError: undefined }
+            : item));
+          cardUrl = await uploadAsset(cardPath, prepared.card);
+        }
+        output.push({ ...photo, url: originalUrl, file: undefined, uploadPath: originalPath, uploadedUrl: originalUrl, cardUrl, cardUploadPath: cardPath, cardUploadedUrl: cardUrl, uploadStatus: "uploaded", uploadError: undefined });
         setPhotos((current) => current.map((item) => item.id === photo.id
-          ? { ...item, uploadPath: path, uploadedUrl: data.publicUrl, uploadStatus: "uploaded", uploadError: undefined }
+          ? { ...item, uploadPath: originalPath, uploadedUrl: originalUrl, cardUrl, cardUploadPath: cardPath, cardUploadedUrl: cardUrl, uploadStatus: "uploaded", uploadError: undefined }
           : item));
         complete += 1;
         setUploadProgress({ complete, total: filePhotos.length, current: "" });
@@ -375,7 +433,7 @@ export default function ProductEditorPage() {
         currency_code: "NGN",
         category_id: form.category_id,
         subcategory_id: form.subcategory_id || null,
-        image_url: uploaded.photos[0]?.url || null,
+        image_url: uploaded.photos[0]?.cardUploadedUrl || uploaded.photos[0]?.cardUrl || uploaded.photos[0]?.url || null,
         stock_quantity: stock,
         featured: form.featured,
         is_new_arrival: form.new_arrival,
@@ -389,10 +447,22 @@ export default function ProductEditorPage() {
         supplier_product_url: form.supplier_url.trim(),
         supplier_price: supplierCost.supplierPrice,
         supplier_currency: supplierCost.supplierCurrency || "NGN",
-        source_image_urls: uploaded.photos.filter((photo) => photo.sourceUrl && photo.sourceUrl !== photo.url).map((photo) => ({ image_url: photo.url, source_url: photo.sourceUrl })),
+        source_image_urls: uploaded.photos.flatMap((photo) => {
+          const sourceUrl = photo.sourceUrl && photo.sourceUrl !== photo.url ? photo.sourceUrl : undefined;
+          const cardImageUrl = photo.cardUrl && photo.cardUrl !== photo.url ? photo.cardUrl : undefined;
+          return sourceUrl || cardImageUrl
+            ? [{ image_url: photo.url, ...(sourceUrl ? { source_url: sourceUrl } : {}), ...(cardImageUrl ? { card_image_url: cardImageUrl } : {}) }]
+            : [];
+        }),
         status: chosenStatus,
       };
-      const imageRows = uploaded.photos.map((photo, index) => ({ image_url: photo.url, alt_text: photo.alt || form.name, sort_order: index }));
+      const imageRows = uploaded.photos.flatMap((photo, index) => {
+        const originalRow = { image_url: photo.url, alt_text: photo.alt || form.name, sort_order: index * 2 };
+        const cardUrl = photo.cardUploadedUrl || photo.cardUrl;
+        return cardUrl && cardUrl !== photo.url
+          ? [originalRow, { image_url: cardUrl, alt_text: photo.alt || form.name, sort_order: index * 2 + 1 }]
+          : [originalRow];
+      });
       const variants = variantList.filter((variant) => variant.label.trim()).map((variant) => {
         const variantPrice = variant.price.trim() ? Number(variant.price) : null;
         const variantStock = Number(variant.stock);
@@ -430,12 +500,16 @@ export default function ProductEditorPage() {
         file: undefined,
         uploadPath: undefined,
         uploadedUrl: undefined,
+        cardUploadPath: undefined,
+        cardUploadedUrl: undefined,
         uploadStatus: undefined,
         uploadError: undefined,
       }));
       photosRef.current = savedPhotos;
       setPhotos(savedPhotos);
+      setCropPhotoId(null);
       setRetryAction(null);
+      setSaveOutcomeUncertain(false);
       setSuccess(chosenStatus === "published" ? "Product saved and marked published in the shared catalogue." : chosenStatus === "draft" ? "Product saved as a draft in the shared catalogue." : `Product changes saved. Current status: ${chosenStatus}.`);
       setForm((current) => ({ ...current, status: chosenStatus }));
       setOriginalAttributes(product.attributes);
@@ -447,7 +521,7 @@ export default function ProductEditorPage() {
       }
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (caught) {
-      if (phase === "ready-to-save" || phase === "save-response") {
+      if (phase === "ready-to-save" && !saveOutcomeUncertain) {
         const uploadedPaths = [...uploadedPathsRef.current];
         if (uploadedPaths.length) {
           const { error: cleanupError } = await db.storage.from("product-images").remove(uploadedPaths);
@@ -455,16 +529,17 @@ export default function ProductEditorPage() {
             setError(`Save failed; temporary image cleanup needs attention. ${describeImageUploadError(cleanupError)} ${safeError(caught)}`);
           } else {
             uploadedPathsRef.current.clear();
-            setPhotos((current) => current.map((photo) => uploadedPaths.includes(photo.uploadPath || "")
-              ? { ...photo, uploadPath: undefined, uploadedUrl: undefined, uploadStatus: undefined, uploadError: undefined }
+            setPhotos((current) => current.map((photo) => uploadedPaths.includes(photo.uploadPath || "") || uploadedPaths.includes(photo.cardUploadPath || "")
+              ? { ...photo, uploadPath: undefined, uploadedUrl: undefined, cardUploadPath: undefined, cardUploadedUrl: undefined, uploadStatus: undefined, uploadError: undefined }
               : photo));
             setError(`Save failed; no catalogue change was confirmed. Temporary uploads were removed, and the selected images and product details are still in the form. ${safeError(caught)}`);
           }
         } else {
           setError(`Save failed; no catalogue change was confirmed. Your product details and selected images are still in the form. ${safeError(caught)}`);
         }
-      } else if (phase === "saving") {
-        setError(`The database did not confirm the save. The form and uploaded images were kept so you can retry without re-uploading. ${safeError(caught)}`);
+      } else if (phase === "saving" || phase === "save-response" || saveOutcomeUncertain) {
+        setSaveOutcomeUncertain(true);
+        setError(`The database outcome is unconfirmed. Your form and uploaded images were kept; check the product record before retrying, and do not remove pending images until you have confirmed the result. ${safeError(caught)}`);
       } else {
         setError(`Save failed. Your product details and selected images are still in the form. ${safeError(caught)}`);
       }
@@ -508,22 +583,34 @@ export default function ProductEditorPage() {
           </section>
 
           <section className="card">
-            <div className="section-title"><h2>Product photos</h2><span className="tag">Use permitted images · 5 MB max after resizing</span></div>
-            <label className="select-photo"><ImagePlus size={25}/><b>Tap to add product photos</b><span className="tag">JPEG, PNG, WebP or AVIF · large phone photos resize on upload</span><input key={fileInputKey} type="file" accept="image/jpeg,image/png,image/webp,image/avif" multiple onChange={addFiles} disabled={saving} style={{ display: "none" }} /></label>
+            <div className="section-title"><h2>Product photos</h2><span className="tag">Use permitted images · 5 MB max per stored version</span></div>
+            <label className="select-photo"><ImagePlus size={25}/><b>Tap to add product photos</b><span className="tag">JPEG, PNG, WebP or AVIF · card versions auto-crop to 4:3; details stay uncropped</span><input key={fileInputKey} type="file" accept="image/jpeg,image/png,image/webp,image/avif" multiple onChange={addFiles} disabled={saving} style={{ display: "none" }} /></label>
             <div className="actions" style={{ marginTop: 10 }}><input className="input" value={urlInput} onChange={(event) => setUrlInput(event.target.value)} placeholder="Add a public HTTPS image URL" disabled={saving} /><button className="button" type="button" onClick={addUrl} disabled={saving}><Link2 size={14}/>Add URL</button></div>
             {externalImageCount > 0 && <div className="notice warn" style={{ marginTop: 10 }}><Link2 size={15}/><span>{externalImageCount} image{externalImageCount === 1 ? " is" : "s are"} still hosted outside NEXTVO Storage and may disappear if the source URL changes. Copy permitted images into Storage using Import, or confirm this external source is permitted and that you understand the availability risk.</span></div>}
             {externalImageCount > 0 && <label className="checkbox" style={{ marginTop: 9 }}><input type="checkbox" checked={externalImagesConfirmed} onChange={(event) => setExternalImagesConfirmed(event.target.checked)} /> I have permission to use these external image URLs and understand they depend on the source website.</label>}
+            {saveOutcomeUncertain && <div className="notice warn" role="status" style={{ marginTop: 10 }}>The previous save has no confirmed result. Uploaded images are being kept; check the product record before retrying or removing a pending image.</div>}
             <div className="photo-strip" style={{ marginTop: 13 }}>
               {photos.map((photo, index) => <div className="photo-tile" key={photo.id}>
                 <img src={photo.url} alt={photo.alt}/>
                 <span style={{ position: "absolute", left: 4, top: 4, padding: "2px 4px", background: "#080b12d9", borderRadius: 5, fontSize: 8 }}>{index === 0 ? "MAIN" : index + 1}{photo.file ? " · NEW" : ""}</span>
-                {photo.file && <span role="status" style={{ position: "absolute", left: 4, right: 4, top: 23, padding: "3px 5px", background: photo.uploadStatus === "failed" ? "#8d2d36e8" : photo.uploadStatus === "uploaded" ? "#17694de8" : "#080b12d9", borderRadius: 5, color: "#fff", fontSize: 9, textAlign: "center" }}>{photo.uploadStatus === "uploading" ? "Uploading…" : photo.uploadStatus === "uploaded" ? "Uploaded · ready to save" : photo.uploadStatus === "failed" ? "Failed · retry available" : photo.file.size > MAX_PRODUCT_IMAGE_BYTES ? "Will resize before upload" : "Ready to upload"}</span>}
+                {photo.file && <span role="status" style={{ position: "absolute", left: 4, right: 4, top: 23, padding: "3px 5px", background: photo.uploadStatus === "failed" ? "#8d2d36e8" : photo.uploadStatus === "uploaded" ? "#17694de8" : "#080b12d9", borderRadius: 5, color: "#fff", fontSize: 9, textAlign: "center" }}>{photo.uploadStatus === "uploading" ? "Preparing / uploading…" : photo.uploadStatus === "uploaded" ? "Uploaded · ready to save" : photo.uploadStatus === "failed" ? "Failed · retry available" : photo.file.size > MAX_PRODUCT_IMAGE_BYTES ? "Will optimize + crop 4:3" : "4:3 crop on save"}</span>}
                 {photo.sourceUrl && <a href={photo.sourceUrl} target="_blank" rel="noreferrer" title={photo.sourceUrl} aria-label={`Open original image source for photo ${index + 1}`} style={{ position: "absolute", left: 4, bottom: 38, padding: "3px 5px", background: "#080b12d9", borderRadius: 5, color: "#d7e5ff", fontSize: 9 }}>SOURCE</a>}
-                <div className="photo-actions"><button type="button" onClick={() => movePhoto(index, -1)} aria-label="Move photo up" disabled={saving}><ArrowUp size={12}/></button><button type="button" onClick={() => movePhoto(index, 1)} aria-label="Move photo down" disabled={saving}><ArrowDown size={12}/></button><button type="button" onClick={() => void removePhoto(index)} aria-label="Remove photo" disabled={saving}><Trash2 size={12}/></button></div>
+                {photo.file && <button type="button" className="photo-crop-action" onClick={() => setCropPhotoId((current) => current === photo.id ? null : photo.id)} aria-label={`Adjust 4:3 crop for ${photo.file.name}`} aria-pressed={cropPhotoId === photo.id} title="Adjust 4:3 crop" disabled={saving}><Crop size={12}/></button>}
+                <div className="photo-actions"><button type="button" onClick={() => movePhoto(index, -1)} aria-label="Move photo up" disabled={saving}><ArrowUp size={12}/></button><button type="button" onClick={() => movePhoto(index, 1)} aria-label="Move photo down" disabled={saving}><ArrowDown size={12}/></button><button type="button" onClick={() => void removePhoto(index)} aria-label="Remove photo" disabled={saving || (saveOutcomeUncertain && Boolean(photo.uploadPath || photo.cardUploadPath))}><Trash2 size={12}/></button></div>
               </div>)}
             </div>
+            {cropPhoto && <div className="image-crop-editor">
+              <div className="image-crop-preview"><img src={cropPhoto.url} alt={`4:3 crop preview for ${cropPhoto.file?.name || form.name}`} style={{ objectPosition: `${Math.round((cropPhoto.cropX ?? 0.5) * 100)}% ${Math.round((cropPhoto.cropY ?? 0.5) * 100)}%` }}/></div>
+              <div className="image-crop-fields">
+                <p className="helper">The center is selected automatically. Move the crop only if the product sits near an edge.</p>
+                <label className="field"><span>Horizontal framing</span><input className="crop-position" type="range" min="0" max="100" value={Math.round((cropPhoto.cropX ?? 0.5) * 100)} onChange={(event) => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropX: Number(event.target.value) / 100 } : photo))}/></label>
+                <label className="field"><span>Vertical framing</span><input className="crop-position" type="range" min="0" max="100" value={Math.round((cropPhoto.cropY ?? 0.5) * 100)} onChange={(event) => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropY: Number(event.target.value) / 100 } : photo))}/></label>
+                <button type="button" className="button small ghost" onClick={() => setCropPhotoId(null)}>Done</button>
+              </div>
+            </div>}
             {photos.filter((photo) => photo.uploadError).map((photo) => <p key={`${photo.id}-error`} role="alert" className="field-note" style={{ color: "#ffb1b1", marginTop: 8 }}>{photo.file?.name}: {photo.uploadError}</p>)}
             {uploadProgress.total > 0 && <div role="status" className="helper" style={{ marginTop: 10 }}><LoaderCircle size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />Uploading image {uploadProgress.complete + 1} of {uploadProgress.total}{uploadProgress.current ? `: ${uploadProgress.current}` : ""}…</div>}
+            {!saving && retryAction && saveOutcomeUncertain && <button className="button ghost" type="button" style={{ marginTop: 10 }} onClick={() => void save(retryAction)}><Save size={14}/>Retry save with retained images</button>}
             {!saving && retryAction && photos.some((photo) => photo.uploadStatus === "failed") && <button className="button ghost" type="button" style={{ marginTop: 10 }} onClick={() => void save(retryAction)}><ImagePlus size={14}/>Retry failed image uploads</button>}
           </section>
 
