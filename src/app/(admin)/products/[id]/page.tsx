@@ -2,13 +2,13 @@
 
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { ArrowLeft, ArrowDown, ArrowUp, Check, Crop, ImagePlus, Link2, LoaderCircle, Plus, Save, Trash2 } from "lucide-react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { STOREFRONT_URL, SUPABASE_CONFIGURED, SUPABASE_URL } from "@/lib/supabase/config";
 import { mergeProductAttributes, resolveProductStatus, validateSupplierCost } from "@/lib/product-domain";
-import { MAX_PRODUCT_IMAGE_BYTES } from "@/lib/image-validation";
-import { describeImageUploadError, isProductCardImageUrl, MAX_PRODUCT_IMAGE_SOURCE_BYTES, prepareProductImages, PRODUCT_CARD_IMAGE_SUFFIX } from "@/lib/product-image-processing";
+import { analyzeProductImage, suggestProductCrop, type DetectionConfidence, type NormalizedRect, type ProductCropOptions } from "@/lib/product-image-detection";
+import { describeImageUploadError, getProductCardSourceRegion, isProductCardImageUrl, MAX_PRODUCT_IMAGE_SOURCE_BYTES, prepareProductImages, PRODUCT_CARD_IMAGE_SUFFIX } from "@/lib/product-image-processing";
 import { formatMoney, safeError, slugify } from "@/lib/format";
 
 const NEW = "new";
@@ -26,6 +26,16 @@ type Photo = {
   cardUploadedUrl?: string;
   cropX?: number;
   cropY?: number;
+  cropZoom?: number;
+  cropMode?: "crop" | "contain";
+  cropConfirmed?: boolean;
+  cropAnalysisState?: "analysing" | "ready" | "failed";
+  cropConfidence?: DetectionConfidence;
+  cropReason?: string;
+  subjectBounds?: NormalizedRect | null;
+  imageWidth?: number;
+  imageHeight?: number;
+  imageHasTransparency?: boolean;
   uploadStatus?: "uploading" | "uploaded" | "failed";
   uploadError?: string;
 };
@@ -142,6 +152,26 @@ export default function ProductEditorPage() {
   );
   const externalImageCount = photos.filter((photo) => !isManagedStorageUrl(photo.url) && !photo.file).length;
   const cropPhoto = photos.find((photo) => photo.id === cropPhotoId && photo.file);
+  const cropOptions: ProductCropOptions | null = cropPhoto ? {
+    x: cropPhoto.cropX ?? 0.5,
+    y: cropPhoto.cropY ?? 0.5,
+    zoom: cropPhoto.cropZoom ?? 1,
+    mode: cropPhoto.cropMode ?? "contain",
+  } : null;
+  const cropPreviewRegion = cropPhoto?.imageWidth && cropPhoto.imageHeight && cropOptions
+    ? getProductCardSourceRegion(cropPhoto.imageWidth, cropPhoto.imageHeight, cropOptions)
+    : null;
+  const cropPreviewStyle: CSSProperties | undefined = cropPhoto && cropPhoto.imageWidth && cropPhoto.imageHeight && cropPreviewRegion?.mode === "crop"
+    ? {
+      position: "absolute",
+      left: `${-cropPreviewRegion.x / cropPreviewRegion.width * 100}%`,
+      top: `${-cropPreviewRegion.y / cropPreviewRegion.height * 100}%`,
+      width: `${cropPhoto.imageWidth / cropPreviewRegion.width * 100}%`,
+      height: `${cropPhoto.imageHeight / cropPreviewRegion.height * 100}%`,
+      maxWidth: "none",
+      maxHeight: "none",
+    }
+    : undefined;
 
   useEffect(() => {
     let live = true;
@@ -252,8 +282,59 @@ export default function ProductEditorPage() {
     else if (good.length !== selected.length) setError("Use non-empty JPEG, PNG, WebP or AVIF images. Images over 5 MB will be resized before upload when possible.");
     else if (unique.length !== good.length) setError("Duplicate file selections were skipped.");
     else setError("");
-    setPhotos((previous) => [...previous, ...unique.map((file) => ({ id: crypto.randomUUID(), url: URL.createObjectURL(file), file, alt: form.name || file.name, cropX: 0.5, cropY: 0.5 }))]);
+    const additions: Photo[] = unique.map((file) => ({
+      id: crypto.randomUUID(),
+      url: URL.createObjectURL(file),
+      file,
+      alt: form.name || file.name,
+      cropX: 0.5,
+      cropY: 0.5,
+      cropZoom: 1,
+      cropMode: "contain",
+      cropConfirmed: false,
+      cropAnalysisState: "analysing",
+    }));
+    setPhotos((previous) => [...previous, ...additions]);
+    if (additions.length) setCropPhotoId(additions[0].id);
     setFileInputKey((key) => key + 1);
+
+    void (async () => {
+      // Keep analysis sequential to avoid a burst of image-decoding memory on phones.
+      for (const photo of additions) {
+        try {
+          const { estimate, width, height, hasTransparency } = await analyzeProductImage(photo.file!);
+          const suggestion = suggestProductCrop(estimate.bounds, estimate.confidence, width, height);
+          setPhotos((current) => current.map((item) => item.id === photo.id
+            ? {
+              ...item,
+              imageWidth: width,
+              imageHeight: height,
+              subjectBounds: estimate.bounds,
+              cropConfidence: estimate.confidence,
+              cropReason: estimate.reason,
+              imageHasTransparency: hasTransparency,
+              cropAnalysisState: "ready",
+              cropX: suggestion.x,
+              cropY: suggestion.y,
+              cropZoom: suggestion.zoom,
+              cropMode: suggestion.mode,
+              cropConfirmed: estimate.confidence === "high",
+            }
+            : item));
+        } catch (caught) {
+          setPhotos((current) => current.map((item) => item.id === photo.id
+            ? {
+              ...item,
+              cropAnalysisState: "failed",
+              cropConfidence: "low",
+              cropReason: caught instanceof Error ? caught.message : "Local visual analysis was unavailable. Use the full-photo fit or adjust the crop manually.",
+              cropMode: "contain",
+              cropConfirmed: false,
+            }
+            : item));
+        }
+      }
+    })();
   }
 
   function movePhoto(index: number, step: number) {
@@ -343,7 +424,12 @@ export default function ProductEditorPage() {
       }
       setUploadProgress({ complete, total: filePhotos.length, current: selectedFile.name });
       try {
-        const prepared = await prepareProductImages(selectedFile, { x: photo.cropX ?? 0.5, y: photo.cropY ?? 0.5 });
+        const prepared = await prepareProductImages(selectedFile, {
+          x: photo.cropX ?? 0.5,
+          y: photo.cropY ?? 0.5,
+          zoom: photo.cropZoom ?? 1,
+          mode: photo.cropMode ?? "contain",
+        });
         const originalExtension = prepared.original.name.split(".").pop()?.toLowerCase() || "webp";
         const cardExtension = prepared.card.name.split(".").pop()?.toLowerCase() || "webp";
         const originalPath = photo.uploadPath || `${user.id}/${photo.id}-original.${originalExtension}`;
@@ -410,6 +496,10 @@ export default function ProductEditorPage() {
     const slug = slugify(form.slug || form.name);
     if (!slug) { setError("Enter a product name or URL slug that produces a valid slug."); return; }
     if (externalImageCount > 0 && !externalImagesConfirmed) { setError("Confirm that externally hosted image URLs are permitted and may become unavailable, or copy permitted images into Storage."); return; }
+    const analysingPhoto = photos.find((photo) => photo.file && photo.cropAnalysisState === "analysing");
+    if (analysingPhoto) { setCropPhotoId(analysingPhoto.id); setError("Wait for the local image review to finish before saving. Your selected photos and product details are still in the form."); return; }
+    const unconfirmedCrop = photos.find((photo) => photo.file && !photo.cropConfirmed);
+    if (unconfirmedCrop) { setCropPhotoId(unconfirmedCrop.id); setError("Review and confirm every suggested crop, or choose the full-photo fit, before saving."); return; }
 
     setRetryAction(action);
     savingRef.current = true;
@@ -587,7 +677,7 @@ export default function ProductEditorPage() {
 
           <section className="card">
             <div className="section-title"><h2>Product photos</h2><span className="tag">Use permitted images · 5 MB max per stored version</span></div>
-            <label className="select-photo"><ImagePlus size={25}/><b>Tap to add product photos</b><span className="tag">JPEG, PNG, WebP or AVIF · card versions auto-crop to 4:3; details stay uncropped</span><input key={fileInputKey} type="file" accept="image/jpeg,image/png,image/webp,image/avif" multiple onChange={addFiles} disabled={saving} style={{ display: "none" }} /></label>
+            <label className="select-photo"><ImagePlus size={25}/><b>Tap to add product photos</b><span className="tag">JPEG, PNG, WebP or AVIF · local visual estimate (not semantic AI) · exact 1600 × 1200 card rendition; original gallery photo stays uncropped</span><input key={fileInputKey} type="file" accept="image/jpeg,image/png,image/webp,image/avif" multiple onChange={addFiles} disabled={saving} style={{ display: "none" }} /></label>
             <div className="actions" style={{ marginTop: 10 }}><input className="input" value={urlInput} onChange={(event) => setUrlInput(event.target.value)} placeholder="Add a public HTTPS image URL" disabled={saving} /><button className="button" type="button" onClick={addUrl} disabled={saving}><Link2 size={14}/>Add URL</button></div>
             {externalImageCount > 0 && <div className="notice warn" style={{ marginTop: 10 }}><Link2 size={15}/><span>{externalImageCount} image{externalImageCount === 1 ? " is" : "s are"} still hosted outside NEXTVO Storage and may disappear if the source URL changes. Copy permitted images into Storage using Import, or confirm this external source is permitted and that you understand the availability risk.</span></div>}
             {externalImageCount > 0 && <label className="checkbox" style={{ marginTop: 9 }}><input type="checkbox" checked={externalImagesConfirmed} onChange={(event) => setExternalImagesConfirmed(event.target.checked)} /> I have permission to use these external image URLs and understand they depend on the source website.</label>}
@@ -596,19 +686,60 @@ export default function ProductEditorPage() {
               {photos.map((photo, index) => <div className="photo-tile" key={photo.id}>
                 <img src={photo.url} alt={photo.alt}/>
                 <span style={{ position: "absolute", left: 4, top: 4, padding: "2px 4px", background: "#080b12d9", borderRadius: 5, fontSize: 8 }}>{index === 0 ? "MAIN" : index + 1}{photo.file ? " · NEW" : ""}</span>
-                {photo.file && <span role="status" style={{ position: "absolute", left: 4, right: 4, top: 23, padding: "3px 5px", background: photo.uploadStatus === "failed" ? "#8d2d36e8" : photo.uploadStatus === "uploaded" ? "#17694de8" : "#080b12d9", borderRadius: 5, color: "#fff", fontSize: 9, textAlign: "center" }}>{photo.uploadStatus === "uploading" ? "Preparing / uploading…" : photo.uploadStatus === "uploaded" ? "Uploaded · ready to save" : photo.uploadStatus === "failed" ? "Failed · retry available" : photo.file.size > MAX_PRODUCT_IMAGE_BYTES ? "Will optimize + crop 4:3" : "4:3 crop on save"}</span>}
+                {photo.file && <span role="status" style={{ position: "absolute", left: 4, right: 4, top: 23, padding: "3px 5px", background: photo.uploadStatus === "failed" ? "#8d2d36e8" : photo.uploadStatus === "uploaded" ? "#17694de8" : "#080b12d9", borderRadius: 5, color: "#fff", fontSize: 9, textAlign: "center" }}>{photo.cropAnalysisState === "analysing" ? "Reviewing locally…" : photo.uploadStatus === "uploading" ? "Preparing / uploading…" : photo.uploadStatus === "uploaded" ? "Uploaded · ready to save" : photo.uploadStatus === "failed" ? "Failed · retry available" : photo.cropConfidence === "high" ? "Clear visual estimate · review" : "Crop review needed"}</span>}
                 {photo.sourceUrl && <a href={photo.sourceUrl} target="_blank" rel="noreferrer" title={photo.sourceUrl} aria-label={`Open original image source for photo ${index + 1}`} style={{ position: "absolute", left: 4, bottom: 38, padding: "3px 5px", background: "#080b12d9", borderRadius: 5, color: "#d7e5ff", fontSize: 9 }}>SOURCE</a>}
                 {photo.file && <button type="button" className="photo-crop-action" onClick={() => setCropPhotoId((current) => current === photo.id ? null : photo.id)} aria-label={`Adjust 4:3 crop for ${photo.file.name}`} aria-pressed={cropPhotoId === photo.id} title="Adjust 4:3 crop" disabled={saving}><Crop size={12}/></button>}
                 <div className="photo-actions"><button type="button" onClick={() => movePhoto(index, -1)} aria-label="Move photo up" disabled={saving}><ArrowUp size={12}/></button><button type="button" onClick={() => movePhoto(index, 1)} aria-label="Move photo down" disabled={saving}><ArrowDown size={12}/></button><button type="button" onClick={() => void removePhoto(index)} aria-label="Remove photo" disabled={saving || (saveOutcomeUncertain && Boolean(photo.uploadPath || photo.cardUploadPath))}><Trash2 size={12}/></button></div>
               </div>)}
             </div>
             {cropPhoto && <div className="image-crop-editor">
-              <div className="image-crop-preview"><img src={cropPhoto.url} alt={`4:3 crop preview for ${cropPhoto.file?.name || form.name}`} style={{ objectPosition: `${Math.round((cropPhoto.cropX ?? 0.5) * 100)}% ${Math.round((cropPhoto.cropY ?? 0.5) * 100)}%` }}/></div>
+              <div className="image-crop-previews">
+                <div className="image-crop-preview-cell">
+                  <h3>Original photo · visual estimate</h3>
+                  <div className="image-source-preview">
+                    <img src={cropPhoto.url} alt={`Original uploaded photograph: ${cropPhoto.file?.name || form.name}`} />
+                    {cropPhoto.subjectBounds && cropPhoto.imageWidth && cropPhoto.imageHeight && <svg className="image-source-overlay" viewBox={`0 0 ${cropPhoto.imageWidth} ${cropPhoto.imageHeight}`} preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+                      <rect x={cropPhoto.subjectBounds.x * cropPhoto.imageWidth} y={cropPhoto.subjectBounds.y * cropPhoto.imageHeight} width={cropPhoto.subjectBounds.width * cropPhoto.imageWidth} height={cropPhoto.subjectBounds.height * cropPhoto.imageHeight} fill="rgba(80, 144, 255, 0.12)" stroke="#76a9ff" strokeWidth={Math.max(2, cropPhoto.imageWidth / 280)} />
+                      {cropPreviewRegion?.mode === "crop" && <rect x={cropPreviewRegion.x} y={cropPreviewRegion.y} width={cropPreviewRegion.width} height={cropPreviewRegion.height} fill="none" stroke="#ffd16b" strokeDasharray={`${cropPhoto.imageWidth / 35} ${cropPhoto.imageWidth / 55}`} strokeWidth={Math.max(2, cropPhoto.imageWidth / 400)} />}
+                    </svg>}
+                  </div>
+                </div>
+                <div className="image-crop-preview-cell">
+                  <h3>Final 4:3 card preview</h3>
+                  <div className={`image-crop-preview${cropPhoto.cropMode === "contain" ? " is-contained" : ""}`}>
+                    {cropPhoto.cropMode === "contain" && cropPhoto.imageHasTransparency === false && <img className="image-crop-blurred-background" src={cropPhoto.url} alt="" aria-hidden="true" />}
+                    <img
+                      className={cropPreviewRegion?.mode === "crop" ? "image-crop-source-crop" : "image-crop-source-contain"}
+                      src={cropPhoto.url}
+                      alt={`4:3 card crop preview for ${cropPhoto.file?.name || form.name}`}
+                      style={cropPreviewStyle || { width: "100%", height: "100%", objectFit: "contain" }}
+                    />
+                  </div>
+                </div>
+              </div>
               <div className="image-crop-fields">
-                <p className="helper">The center is selected automatically. Move the crop only if the product sits near an edge.</p>
-                <label className="field"><span>Horizontal framing</span><input className="crop-position" type="range" min="0" max="100" value={Math.round((cropPhoto.cropX ?? 0.5) * 100)} onChange={(event) => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropX: Number(event.target.value) / 100 } : photo))}/></label>
-                <label className="field"><span>Vertical framing</span><input className="crop-position" type="range" min="0" max="100" value={Math.round((cropPhoto.cropY ?? 0.5) * 100)} onChange={(event) => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropY: Number(event.target.value) / 100 } : photo))}/></label>
-                <button type="button" className="button small ghost" onClick={() => setCropPhotoId(null)}>Done</button>
+                <p className="helper"><strong>Important:</strong> this local contrast/saliency estimate is not semantic AI and does not identify product categories. It never uploads the photo for analysis. {cropPhoto.cropReason || "Checking the image locally…"}</p>
+                {cropPhoto.cropConfidence && <p className={`crop-confidence confidence-${cropPhoto.cropConfidence}`} role="status"><strong>{cropPhoto.cropAnalysisState === "analysing" ? "Reviewing" : cropPhoto.cropConfidence === "high" ? "Clear visual estimate" : cropPhoto.cropConfidence === "medium" ? "Possible subject area" : "Manual review needed"}</strong>{cropPhoto.cropReason ? ` · ${cropPhoto.cropReason}` : ""}</p>}
+                {cropPhoto.cropMode === "contain" && cropPhoto.imageHasTransparency === false && <p className="helper">To keep the whole photo visible, the frame softly extends the same photograph behind it; the centered original photo remains intact. Transparent PNG/WebP/AVIF artwork keeps its transparency.</p>}
+                <div className="crop-control-row">
+                  <button type="button" className="button small ghost" onClick={() => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropConfirmed: true } : photo))} disabled={saving || cropPhoto.cropAnalysisState !== "ready" || cropPhoto.cropConfidence === "low"}>Accept suggested crop</button>
+                  <button type="button" className="button small ghost" onClick={() => {
+                    if (!cropPhoto.imageWidth || !cropPhoto.imageHeight) return;
+                    const suggestion = suggestProductCrop(cropPhoto.subjectBounds ?? null, cropPhoto.cropConfidence ?? "low", cropPhoto.imageWidth, cropPhoto.imageHeight);
+                    setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropX: suggestion.x, cropY: suggestion.y, cropZoom: suggestion.zoom, cropMode: suggestion.mode, cropConfirmed: photo.cropConfidence === "high" } : photo));
+                  }} disabled={saving || cropPhoto.cropAnalysisState !== "ready"}>Reset to automatic crop</button>
+                  <button type="button" className="button small ghost" onClick={() => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropX: 0.5, cropY: 0.5, cropZoom: 1, cropMode: "contain", cropConfirmed: true } : photo))} disabled={saving || cropPhoto.cropAnalysisState !== "ready"}>Use safe full-photo fit</button>
+                </div>
+                <label className="field"><span>Horizontal framing · move crop area</span><input className="crop-position" type="range" min="0" max="100" value={Math.round((cropPhoto.cropX ?? 0.5) * 100)} disabled={saving || cropPhoto.cropAnalysisState !== "ready" || cropPhoto.cropMode === "contain"} onChange={(event) => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropX: Number(event.target.value) / 100, cropConfirmed: false } : photo))}/></label>
+                <label className="field"><span>Vertical framing · move crop area</span><input className="crop-position" type="range" min="0" max="100" value={Math.round((cropPhoto.cropY ?? 0.5) * 100)} disabled={saving || cropPhoto.cropAnalysisState !== "ready" || cropPhoto.cropMode === "contain"} onChange={(event) => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropY: Number(event.target.value) / 100, cropConfirmed: false } : photo))}/></label>
+                <label className="field"><span>Zoom · {Math.round((cropPhoto.cropZoom ?? 1) * 100)}%</span><input className="crop-position" type="range" min="100" max="400" step="5" value={Math.round((cropPhoto.cropZoom ?? 1) * 100)} disabled={saving || cropPhoto.cropAnalysisState !== "ready"} onChange={(event) => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropZoom: Number(event.target.value) / 100, cropMode: "crop", cropConfirmed: false } : photo))}/></label>
+                <div className="crop-control-row">
+                  <button type="button" className="button small ghost" onClick={() => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropZoom: Math.max(1, (photo.cropZoom ?? 1) - 0.2), cropMode: "crop", cropConfirmed: false } : photo))} disabled={saving || cropPhoto.cropAnalysisState !== "ready" || (cropPhoto.cropZoom ?? 1) <= 1}>Zoom out</button>
+                  <button type="button" className="button small ghost" onClick={() => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropZoom: Math.min(4, (photo.cropZoom ?? 1) + 0.2), cropMode: "crop", cropConfirmed: false } : photo))} disabled={saving || cropPhoto.cropAnalysisState !== "ready" || (cropPhoto.cropZoom ?? 1) >= 4}>Zoom in</button>
+                  <button type="button" className="button small" onClick={() => setPhotos((current) => current.map((photo) => photo.id === cropPhoto.id ? { ...photo, cropConfirmed: true } : photo))} disabled={saving || cropPhoto.cropAnalysisState !== "ready"}>Confirm final crop</button>
+                  <button type="button" className="button small ghost" onClick={() => setCropPhotoId(null)}>Done</button>
+                </div>
+                {!cropPhoto.cropConfirmed && cropPhoto.cropAnalysisState === "ready" && <p className="crop-confirmation-note">This image needs confirmation before the product can be saved.</p>}
               </div>
             </div>}
             {photos.filter((photo) => photo.uploadError).map((photo) => <p key={`${photo.id}-error`} role="alert" className="field-note" style={{ color: "#ffb1b1", marginTop: 8 }}>{photo.file?.name}: {photo.uploadError}</p>)}

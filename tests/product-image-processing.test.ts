@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { describeImageUploadError, isProductCardImageUrl, prepareProductImages } from "../src/lib/product-image-processing";
+import { describeImageUploadError, getProductCardSourceRegion, isProductCardImageUrl, prepareProductImages } from "../src/lib/product-image-processing";
 
 type DrawRecord = { width: number; height: number; args: number[] };
 
@@ -13,34 +13,55 @@ function sourceFile(name: string, mime: string, size = 1024): File {
   return new File([bytes], name, { type: mime, lastModified: 1234 });
 }
 
-function mockImageBrowser(width: number, height: number, options: { webpUnsupported?: boolean; blobSize?: number } = {}) {
+function mockImageBrowser(width: number, height: number, options: { webpUnsupported?: boolean; blobSize?: number; hasTransparency?: boolean } = {}) {
   const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
   const previousBitmap = Object.getOwnPropertyDescriptor(globalThis, "createImageBitmap");
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
   const draws: DrawRecord[] = [];
   let bitmapClosed = false;
   let orientation: unknown;
-  const canvas = {
-    width: 0,
-    height: 0,
-    getContext: () => ({
-      imageSmoothingEnabled: false,
-      imageSmoothingQuality: "low",
-      drawImage: (...args: number[]) => draws.push({ width: canvas.width, height: canvas.height, args }),
-    }),
-    toBlob: (callback: (blob: Blob | null) => void, type = "image/png") => {
-      const actualType = options.webpUnsupported && type === "image/webp" ? "image/png" : type;
-      callback(new Blob([new Uint8Array(options.blobSize ?? 2048)], { type: actualType }));
-    },
+  const createCanvas = () => {
+    const canvas = {
+      width: 0,
+      height: 0,
+      getContext: () => ({
+        imageSmoothingEnabled: false,
+        imageSmoothingQuality: "low",
+        filter: "none",
+        save: () => undefined,
+        restore: () => undefined,
+        drawImage: (...args: number[]) => {
+          if (canvas.width !== 96 || canvas.height !== 96) draws.push({ width: canvas.width, height: canvas.height, args });
+        },
+        getImageData: () => {
+          const data = new Uint8ClampedArray(96 * 96 * 4);
+          for (let index = 3; index < data.length; index += 4) data[index] = options.hasTransparency && index === 3 ? 0 : 255;
+          return { data } as ImageData;
+        },
+      }),
+      toBlob: (callback: (blob: Blob | null) => void, type = "image/png") => {
+        const actualType = options.webpUnsupported && type === "image/webp" ? "image/png" : type;
+        callback(new Blob([new Uint8Array(options.blobSize ?? 2048)], { type: actualType }));
+      },
+    };
+    return canvas;
   };
   Object.defineProperty(globalThis, "document", {
     configurable: true,
-    value: { createElement: () => canvas as unknown as HTMLCanvasElement },
+    value: { createElement: () => createCanvas() as unknown as HTMLCanvasElement },
   });
   Object.defineProperty(globalThis, "createImageBitmap", {
     configurable: true,
     value: async (_file: File, bitmapOptions?: ImageBitmapOptions) => {
       orientation = bitmapOptions?.imageOrientation;
       return { width, height, close: () => { bitmapClosed = true; } };
+    },
+  });
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      setTimeout: globalThis.setTimeout.bind(globalThis),
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
     },
   });
   return {
@@ -52,6 +73,8 @@ function mockImageBrowser(width: number, height: number, options: { webpUnsuppor
       else Reflect.deleteProperty(globalThis, "document");
       if (previousBitmap) Object.defineProperty(globalThis, "createImageBitmap", previousBitmap);
       else Reflect.deleteProperty(globalThis, "createImageBitmap");
+      if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+      else Reflect.deleteProperty(globalThis, "window");
     },
   };
 }
@@ -88,11 +111,11 @@ test("square product images remain byte-for-byte unchanged for the detail galler
     const prepared = await prepareProductImages(source);
     assert.deepEqual(new Uint8Array(await prepared.original.arrayBuffer()), new Uint8Array(await source.arrayBuffer()));
     assert.equal(prepared.original.type, "image/png");
-    assert.equal(prepared.card.type, "image/webp");
+    assert.equal(prepared.card.type, "image/jpeg");
     const draw = browser.draws.at(-1)!;
-    assert.deepEqual([draw.width, draw.height], [1200, 900]);
+    assert.deepEqual([draw.width, draw.height], [1600, 1200]);
     assert.deepEqual(draw.args.slice(1, 5), [0, 150, 1200, 900]);
-    assert.deepEqual(draw.args.slice(5), [0, 0, 1200, 900]);
+    assert.deepEqual(draw.args.slice(5), [0, 0, 1600, 1200]);
     assert.equal(browser.orientation, "from-image");
     assert.ok(browser.bitmapClosed);
   } finally {
@@ -105,9 +128,9 @@ test("portrait photos support a user-adjusted vertical crop position", async () 
   try {
     const prepared = await prepareProductImages(sourceFile("portrait.jpg", "image/jpeg"), { x: 0.5, y: 0.8 });
     const draw = browser.draws.at(-1)!;
-    assert.deepEqual([draw.width, draw.height], [800, 600]);
+    assert.deepEqual([draw.width, draw.height], [1600, 1200]);
     assert.deepEqual(draw.args.slice(1, 5), [0, 480, 800, 600]);
-    assert.deepEqual(draw.args.slice(5), [0, 0, 800, 600]);
+    assert.deepEqual(draw.args.slice(5), [0, 0, 1600, 1200]);
     assert.equal(prepared.card.type, "image/jpeg");
   } finally {
     browser.restore();
@@ -137,8 +160,8 @@ test("large Android-style PNGs keep a full-frame detail rendition and a separate
     assert.equal(prepared.height, 3000);
     assert.deepEqual([browser.draws[0].width, browser.draws[0].height], [2400, 1800]);
     assert.deepEqual([browser.draws[1].width, browser.draws[1].height], [1600, 1200]);
-    assert.equal(prepared.original.type, "image/webp");
-    assert.equal(prepared.card.type, "image/webp");
+    assert.equal(prepared.original.type, "image/jpeg");
+    assert.equal(prepared.card.type, "image/jpeg");
     assert.ok(prepared.original.size <= 5 * 1024 * 1024);
     assert.ok(prepared.card.size <= 5 * 1024 * 1024);
     assert.equal(browser.orientation, "from-image");
@@ -149,7 +172,7 @@ test("large Android-style PNGs keep a full-frame detail rendition and a separate
 });
 
 test("transparent PNG cards fall back to PNG when the browser cannot encode WebP", async () => {
-  const browser = mockImageBrowser(800, 600, { webpUnsupported: true });
+  const browser = mockImageBrowser(800, 600, { webpUnsupported: true, hasTransparency: true });
   try {
     const prepared = await prepareProductImages(sourceFile("transparent.png", "image/png"));
     assert.equal(prepared.original.type, "image/png");
@@ -165,4 +188,26 @@ test("generated card rendition filenames are distinguishable from legacy product
   assert.equal(isProductCardImageUrl("https://example.com/storage/product-card.webp"), false);
   assert.equal(isProductCardImageUrl("https://example.com/storage/product-123.jpg"), false);
   assert.equal(isProductCardImageUrl(null), false);
+});
+
+test("zoomed crop geometry stays proportional and moves toward an off-centre subject", () => {
+  assert.deepEqual(
+    getProductCardSourceRegion(2400, 1200, { x: 0.25, y: 0.5, zoom: 2, mode: "crop" }),
+    { mode: "crop", x: 400, y: 300, width: 800, height: 600 },
+  );
+});
+
+test("safe contain framing keeps the entire portrait photograph in the 4:3 card", async () => {
+  const browser = mockImageBrowser(800, 1200);
+  try {
+    const source = sourceFile("portrait-safe.png", "image/png");
+    const prepared = await prepareProductImages(source, { x: 0.5, y: 0.5, zoom: 1, mode: "contain" });
+    const draw = browser.draws.at(-1)!;
+    assert.deepEqual([draw.width, draw.height], [1600, 1200]);
+    assert.deepEqual(draw.args.slice(1), [0, 0, 800, 1200, 400, 0, 800, 1200]);
+    assert.deepEqual(new Uint8Array(await prepared.original.arrayBuffer()), new Uint8Array(await source.arrayBuffer()));
+    assert.equal(prepared.card.size <= 5 * 1024 * 1024, true);
+  } finally {
+    browser.restore();
+  }
 });

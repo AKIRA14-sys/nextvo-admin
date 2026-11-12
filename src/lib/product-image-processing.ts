@@ -1,10 +1,11 @@
 import { MAX_PRODUCT_IMAGE_BYTES, sniffProductImageMime } from "./image-validation";
+import type { ProductCropOptions } from "./product-image-detection";
 
 export const MAX_PRODUCT_IMAGE_SOURCE_BYTES = 30 * 1024 * 1024;
 export const PRODUCT_CARD_IMAGE_SUFFIX = "-nextvo-card";
 const MAX_DETAIL_LONG_EDGE = 2400;
-const PRODUCT_CARD_WIDTH = 1600;
-const PRODUCT_CARD_HEIGHT = 1200;
+export const PRODUCT_CARD_WIDTH = 1600;
+export const PRODUCT_CARD_HEIGHT = 1200;
 const TARGET_CARD_RATIO = 4 / 3;
 const OUTPUT_MIME_BY_EXTENSION: Record<string, string> = {
   "image/jpeg": "jpg",
@@ -13,9 +14,15 @@ const OUTPUT_MIME_BY_EXTENSION: Record<string, string> = {
   "image/avif": "avif",
 };
 const ENCODE_SCALES = [1, 0.85, 0.7, 0.55, 0.4];
-const ENCODE_QUALITIES = [0.9, 0.84, 0.78, 0.72, 0.64];
+const ENCODE_QUALITIES = [0.9, 0.84, 0.78, 0.72, 0.64, 0.56, 0.48, 0.4, 0.34];
 
-type CropPosition = { x: number; y: number };
+export type ProductCardSourceRegion = {
+  mode: "crop" | "contain";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
 export type PreparedProductImages = { original: File; card: File; width: number; height: number };
 
 function imageExtension(mime: string): string {
@@ -31,13 +38,47 @@ function clampPosition(value: number | undefined): number {
   return Number.isFinite(value) ? Math.min(1, Math.max(0, value as number)) : 0.5;
 }
 
+function clampZoom(value: number | undefined): number {
+  return Number.isFinite(value) ? Math.min(4, Math.max(1, value as number)) : 1;
+}
+
+export function getProductCardSourceRegion(
+  imageWidth: number,
+  imageHeight: number,
+  crop: ProductCropOptions = { x: 0.5, y: 0.5, zoom: 1, mode: "crop" },
+): ProductCardSourceRegion {
+  if (crop.mode === "contain") return { mode: "contain", x: 0, y: 0, width: imageWidth, height: imageHeight };
+  const ratio = imageWidth / imageHeight;
+  const width = ratio > TARGET_CARD_RATIO ? imageHeight * TARGET_CARD_RATIO : imageWidth;
+  const zoom = clampZoom(crop.zoom);
+  const sourceWidth = width / zoom;
+  const sourceHeight = sourceWidth / TARGET_CARD_RATIO;
+  return {
+    mode: "crop",
+    x: (imageWidth - sourceWidth) * clampPosition(crop.x),
+    y: (imageHeight - sourceHeight) * clampPosition(crop.y),
+    width: sourceWidth,
+    height: sourceHeight,
+  };
+}
+
 function canvasBlob(canvas: HTMLCanvasElement, mime: string, quality?: number): Promise<Blob> {
   return new Promise((resolve, reject) => {
-    canvas.toBlob(
-      (blob) => (blob ? resolve(blob) : reject(new Error("The browser could not encode this image."))),
-      mime,
-      quality,
-    );
+    const timeout = window.setTimeout(() => reject(new Error("The browser image encoder timed out.")), 5000);
+    try {
+      canvas.toBlob(
+        (blob) => {
+          window.clearTimeout(timeout);
+          if (blob) resolve(blob);
+          else reject(new Error("The browser could not encode this image."));
+        },
+        mime,
+        quality,
+      );
+    } catch (error) {
+      window.clearTimeout(timeout);
+      reject(error);
+    }
   });
 }
 
@@ -53,13 +94,10 @@ async function encodeCanvasBelowLimit(
 ): Promise<File> {
   const fallbackMime = preserveAlpha ? "image/png" : "image/jpeg";
   const mimeChoices = preferredMime === fallbackMime ? [preferredMime] : [preferredMime, fallbackMime];
-  for (const scale of ENCODE_SCALES) {
-    let width = Math.max(1, Math.floor(baseWidth * scale));
-    let height = Math.max(1, Math.floor(baseHeight * scale));
-    if (keepFourToThree) {
-      width = Math.max(4, Math.floor(width / 4) * 4);
-      height = (width / 4) * 3;
-    }
+  const scales = keepFourToThree ? [1] : ENCODE_SCALES;
+  for (const scale of scales) {
+    const width = keepFourToThree ? PRODUCT_CARD_WIDTH : Math.max(1, Math.floor(baseWidth * scale));
+    const height = keepFourToThree ? PRODUCT_CARD_HEIGHT : Math.max(1, Math.floor(baseHeight * scale));
     const canvas = document.createElement("canvas");
     canvas.width = width;
     canvas.height = height;
@@ -85,6 +123,9 @@ async function encodeCanvasBelowLimit(
       }
     }
   }
+  if (keepFourToThree) {
+    throw new Error("The card image could not be encoded as an exact 1600 × 1200 rendition under the existing 5 MB Storage limit. Choose a smaller or less detailed source image; the original photo has not been replaced.");
+  }
   throw new Error("The image is still larger than 5 MB after resizing. Choose a smaller image.");
 }
 
@@ -105,11 +146,13 @@ async function decodeOrientedImage(file: File): Promise<ImageBitmap> {
   }
 }
 
-function preferredOutputMime(sourceMime: string): string {
-  return sourceMime === "image/jpeg" ? "image/jpeg" : "image/webp";
+function preferredOutputMime(_sourceMime: string, preserveAlpha: boolean): string {
+  // JPEG is the broadly reliable, compact path for opaque product photos.
+  // Use WebP only when alpha must be preserved; PNG is the bounded fallback.
+  return preserveAlpha ? "image/webp" : "image/jpeg";
 }
 
-function renderFullFrame(bitmap: ImageBitmap, file: File, sourceMime: string): Promise<File> {
+function renderFullFrame(bitmap: ImageBitmap, file: File, sourceMime: string, preserveAlpha: boolean): Promise<File> {
   const scale = Math.min(1, MAX_DETAIL_LONG_EDGE / Math.max(bitmap.width, bitmap.height));
   const width = Math.max(1, Math.round(bitmap.width * scale));
   const height = Math.max(1, Math.round(bitmap.height * scale));
@@ -117,53 +160,122 @@ function renderFullFrame(bitmap: ImageBitmap, file: File, sourceMime: string): P
     (context, targetWidth, targetHeight) => context.drawImage(bitmap, 0, 0, targetWidth, targetHeight),
     width,
     height,
-    preferredOutputMime(sourceMime),
-    sourceMime !== "image/jpeg",
+    preferredOutputMime(sourceMime, preserveAlpha),
+    preserveAlpha,
     file.name,
     file.lastModified,
   );
 }
 
-function renderCardFrame(bitmap: ImageBitmap, file: File, sourceMime: string, crop: CropPosition): Promise<File> {
-  const ratio = bitmap.width / bitmap.height;
-  const sourceWidth = ratio > TARGET_CARD_RATIO ? bitmap.height * TARGET_CARD_RATIO : bitmap.width;
-  const sourceHeight = sourceWidth / TARGET_CARD_RATIO;
-  const sourceX = (bitmap.width - sourceWidth) * clampPosition(crop.x);
-  const sourceY = (bitmap.height - sourceHeight) * clampPosition(crop.y);
-  const scale = Math.min(1, PRODUCT_CARD_WIDTH / sourceWidth, PRODUCT_CARD_HEIGHT / sourceHeight);
-  const width = Math.max(4, Math.floor((sourceWidth * scale) / 4) * 4);
-  const height = (width / 4) * 3;
-  const preferredMime = preferredOutputMime(sourceMime);
+function drawContainComposition(
+  context: CanvasRenderingContext2D,
+  bitmap: ImageBitmap,
+  targetWidth: number,
+  targetHeight: number,
+  preserveAlpha: boolean,
+): void {
+  const containScale = Math.min(targetWidth / bitmap.width, targetHeight / bitmap.height);
+  const photoWidth = bitmap.width * containScale;
+  const photoHeight = bitmap.height * containScale;
+  const offsetX = (targetWidth - photoWidth) / 2;
+  const offsetY = (targetHeight - photoHeight) / 2;
+
+  if (!preserveAlpha) {
+    // Any area outside the full, unchanged photograph is extended from that same
+    // photo, rather than replaced with a white studio background or a new image.
+    const backgroundWidth = 320;
+    const backgroundHeight = 240;
+    const backgroundCanvas = document.createElement("canvas");
+    backgroundCanvas.width = backgroundWidth;
+    backgroundCanvas.height = backgroundHeight;
+    const backgroundContext = backgroundCanvas.getContext("2d", { alpha: false });
+    if (backgroundContext) {
+      const coverScale = Math.max(backgroundWidth / bitmap.width, backgroundHeight / bitmap.height);
+      const coverWidth = bitmap.width * coverScale;
+      const coverHeight = bitmap.height * coverScale;
+      backgroundContext.drawImage(bitmap, (backgroundWidth - coverWidth) / 2, (backgroundHeight - coverHeight) / 2, coverWidth, coverHeight);
+      const blurredCanvas = document.createElement("canvas");
+      blurredCanvas.width = backgroundWidth;
+      blurredCanvas.height = backgroundHeight;
+      const blurredContext = blurredCanvas.getContext("2d", { alpha: false });
+      if (blurredContext) {
+        blurredContext.drawImage(backgroundCanvas, 0, 0);
+        blurredContext.save();
+        blurredContext.filter = "blur(6px)";
+        blurredContext.drawImage(backgroundCanvas, 0, 0);
+        blurredContext.restore();
+        context.drawImage(blurredCanvas, 0, 0, targetWidth, targetHeight);
+      } else {
+        context.drawImage(backgroundCanvas, 0, 0, targetWidth, targetHeight);
+      }
+    }
+  }
+  context.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, offsetX, offsetY, photoWidth, photoHeight);
+}
+
+function renderCardFrame(
+  bitmap: ImageBitmap,
+  file: File,
+  sourceMime: string,
+  crop: ProductCropOptions,
+  preserveAlpha: boolean,
+): Promise<File> {
+  const region = getProductCardSourceRegion(bitmap.width, bitmap.height, crop);
+  const preferredMime = preferredOutputMime(sourceMime, preserveAlpha);
   const stem = file.name.replace(/\.[^.]*$/, "").trim() || "product-image";
 
   return encodeCanvasBelowLimit(
-    (context, targetWidth, targetHeight) => context.drawImage(
-      bitmap,
-      sourceX,
-      sourceY,
-      sourceWidth,
-      sourceHeight,
-      0,
-      0,
-      targetWidth,
-      targetHeight,
-    ),
-    width,
-    height,
+    (context, targetWidth, targetHeight) => {
+      if (region.mode === "contain") {
+        drawContainComposition(context, bitmap, targetWidth, targetHeight, preserveAlpha);
+      } else {
+        context.drawImage(
+          bitmap,
+          region.x,
+          region.y,
+          region.width,
+          region.height,
+          0,
+          0,
+          targetWidth,
+          targetHeight,
+        );
+      }
+    },
+    PRODUCT_CARD_WIDTH,
+    PRODUCT_CARD_HEIGHT,
     preferredMime,
-    sourceMime !== "image/jpeg",
+    preserveAlpha,
     `${stem}${PRODUCT_CARD_IMAGE_SUFFIX}`,
     file.lastModified,
     true,
   );
 }
 
+function bitmapHasTransparency(bitmap: ImageBitmap, sourceMime: string): boolean {
+  if (sourceMime === "image/jpeg") return false;
+  const canvas = document.createElement("canvas");
+  canvas.width = 96;
+  canvas.height = 96;
+  const context = canvas.getContext("2d", { alpha: true, willReadFrequently: true });
+  if (!context) return true;
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+  for (let index = 3; index < pixels.length; index += 4) {
+    if (pixels[index] < 255) return true;
+  }
+  return false;
+}
+
 /**
  * Keep an under-limit source file uncropped for the detail gallery. If a phone
  * photo exceeds Storage's per-file limit, make a high-quality full-frame copy;
- * always generate a separate, proportional 4:3 rendition for product cards.
+ * always generate a separate, proportional 1600 × 1200 card rendition.
  */
-export async function prepareProductImages(file: File, crop: CropPosition = { x: 0.5, y: 0.5 }): Promise<PreparedProductImages> {
+export async function prepareProductImages(
+  file: File,
+  crop: ProductCropOptions = { x: 0.5, y: 0.5, zoom: 1, mode: "crop" },
+): Promise<PreparedProductImages> {
   if (!file.size) throw new Error("The selected image is empty.");
   if (file.size > MAX_PRODUCT_IMAGE_SOURCE_BYTES) {
     throw new Error("This image is too large to process on this device (maximum source size: 30 MB).");
@@ -179,10 +291,11 @@ export async function prepareProductImages(file: File, crop: CropPosition = { x:
   const bitmap = await decodeOrientedImage(file);
   try {
     if (!bitmap.width || !bitmap.height) throw new Error("The selected image has invalid dimensions.");
+    const preserveAlpha = bitmapHasTransparency(bitmap, actualMime);
     const original = file.size <= MAX_PRODUCT_IMAGE_BYTES
       ? new File([file], withImageExtension(file.name, imageExtension(actualMime)), { type: actualMime, lastModified: file.lastModified })
-      : await renderFullFrame(bitmap, file, actualMime);
-    const card = await renderCardFrame(bitmap, file, actualMime, crop);
+      : await renderFullFrame(bitmap, file, actualMime, preserveAlpha);
+    const card = await renderCardFrame(bitmap, file, actualMime, crop, preserveAlpha);
     return { original, card, width: bitmap.width, height: bitmap.height };
   } finally {
     bitmap.close();
