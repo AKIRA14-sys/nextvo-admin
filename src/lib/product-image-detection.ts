@@ -1,3 +1,5 @@
+import { createStableProductImage } from "./product-image-file";
+
 export type NormalizedRect = { x: number; y: number; width: number; height: number };
 export type DetectionConfidence = "high" | "medium" | "low";
 export type ProductImageEstimate = {
@@ -253,14 +255,30 @@ export function suggestProductCrop(
 }
 
 export async function analyzeProductImage(file: File): Promise<{ estimate: ProductImageEstimate; width: number; height: number; hasTransparency: boolean }> {
+  const stableFile = await createStableProductImage(file);
   if (typeof createImageBitmap !== "function" || typeof document === "undefined") {
     throw new Error("This browser cannot analyse images locally. Use the full-photo fallback or adjust the crop manually.");
   }
   let bitmap: ImageBitmap;
   try {
-    bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
-  } catch {
-    bitmap = await createImageBitmap(file);
+    bitmap = await createImageBitmap(stableFile, { imageOrientation: "from-image" });
+  } catch (firstError) {
+    try {
+      bitmap = await createImageBitmap(stableFile);
+    } catch (error) {
+      const failure = [firstError, error].find((item) => item && typeof item === "object" &&
+        "name" in item && ["NotReadableError", "NotFoundError", "SecurityError", "NotAllowedError"].includes(String(item.name))) || error;
+      const name = failure && typeof failure === "object" && "name" in failure ? String(failure.name) : "";
+      const detail = failure && typeof failure === "object" && "message" in failure ? String(failure.message) : "";
+      const explanation = name === "NotFoundError"
+        ? "The stable image copy is no longer available to the browser."
+        : name === "SecurityError" || name === "NotAllowedError"
+          ? "The browser denied access to the stable image copy during analysis."
+          : name === "NotReadableError"
+            ? "The browser could not read the stable image copy during analysis."
+            : "The stable image copy could not be decoded for local analysis.";
+      throw new Error(`${explanation}${name ? ` (${name})` : ""}${detail ? ` ${detail}` : ""} Select the image again or choose another supported image.`);
+    }
   }
   try {
     const scale = Math.min(1, MAX_ANALYSIS_EDGE / Math.max(bitmap.width, bitmap.height));

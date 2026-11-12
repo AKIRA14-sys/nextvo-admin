@@ -8,6 +8,7 @@ import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { STOREFRONT_URL, SUPABASE_CONFIGURED, SUPABASE_URL } from "@/lib/supabase/config";
 import { mergeProductAttributes, resolveProductStatus, validateSupplierCost } from "@/lib/product-domain";
 import { analyzeProductImage, suggestProductCrop, type DetectionConfidence, type NormalizedRect, type ProductCropOptions } from "@/lib/product-image-detection";
+import { createStableProductImage, ProductImageFileError } from "@/lib/product-image-file";
 import { describeImageUploadError, getProductCardSourceRegion, isProductCardImageUrl, MAX_PRODUCT_IMAGE_SOURCE_BYTES, prepareProductImages, PRODUCT_CARD_IMAGE_SUFFIX } from "@/lib/product-image-processing";
 import { formatMoney, safeError, slugify } from "@/lib/format";
 
@@ -131,10 +132,13 @@ export default function ProductEditorPage() {
   const [externalImagesConfirmed, setExternalImagesConfirmed] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ complete: 0, total: 0, current: "" });
   const [retryAction, setRetryAction] = useState<"draft" | "published" | "current" | null>(null);
+  const [processingImages, setProcessingImages] = useState(false);
+  const [retryImageSelection, setRetryImageSelection] = useState(false);
   const [saveOutcomeUncertain, setSaveOutcomeUncertain] = useState(false);
   const savingRef = useRef(false);
   const uploadedPathsRef = useRef(new Set<string>());
   const photosRef = useRef<Photo[]>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     photosRef.current = photos;
@@ -264,76 +268,82 @@ export default function ProductEditorPage() {
   }
 
   function addFiles(event: ChangeEvent<HTMLInputElement>) {
-    const selected = Array.from(event.target.files || []);
+    const selected = Array.from(event.currentTarget.files || []);
+    if (!selected.length) return;
+
     const acceptedTypes = ["image/jpeg", "image/png", "image/webp", "image/avif"];
     const acceptedExtensions = /\.(jpe?g|png|webp|avif)$/i;
-    const good = selected.filter((file) => {
-      const typeCanBeSniffed = !file.type || file.type === "application/octet-stream";
-      return (acceptedTypes.includes(file.type) || (typeCanBeSniffed && acceptedExtensions.test(file.name))) && file.size > 0 && file.size <= MAX_PRODUCT_IMAGE_SOURCE_BYTES;
-    });
     const existingKeys = new Set(photos.filter((photo) => photo.file).map((photo) => `${photo.file?.name}:${photo.file?.size}:${photo.file?.lastModified}`));
-    const unique = good.filter((file) => {
-      const key = `${file.name}:${file.size}:${file.lastModified}`;
-      if (existingKeys.has(key)) return false;
-      existingKeys.add(key);
-      return true;
-    });
-    if (selected.some((file) => file.size > MAX_PRODUCT_IMAGE_SOURCE_BYTES)) setError("Each source image must be 30 MB or smaller. Images over 5 MB are resized in the browser when possible.");
-    else if (good.length !== selected.length) setError("Use non-empty JPEG, PNG, WebP or AVIF images. Images over 5 MB will be resized before upload when possible.");
-    else if (unique.length !== good.length) setError("Duplicate file selections were skipped.");
-    else setError("");
-    const additions: Photo[] = unique.map((file) => ({
-      id: crypto.randomUUID(),
-      url: URL.createObjectURL(file),
-      file,
-      alt: form.name || file.name,
-      cropX: 0.5,
-      cropY: 0.5,
-      cropZoom: 1,
-      cropMode: "contain",
-      cropConfirmed: false,
-      cropAnalysisState: "analysing",
-    }));
-    setPhotos((previous) => [...previous, ...additions]);
-    if (additions.length) setCropPhotoId(additions[0].id);
-    setFileInputKey((key) => key + 1);
+    const candidates: File[] = [];
+    const failures: string[] = [];
+    let canRetrySelection = false;
 
+    for (const file of selected) {
+      const typeCanBeSniffed = !file.type || file.type === "application/octet-stream";
+      const supportedType = acceptedTypes.includes(file.type) || (typeCanBeSniffed && acceptedExtensions.test(file.name));
+      if (file.size > MAX_PRODUCT_IMAGE_SOURCE_BYTES) {
+        failures.push(`${file.name}: Reading selected image failed. Source images must be 30 MB or smaller.`);
+        canRetrySelection = true;
+        continue;
+      }
+      if (!file.size || !supportedType) {
+        failures.push(`${file.name}: Reading selected image failed. Choose a non-empty JPEG, PNG, WebP or AVIF image.`);
+        canRetrySelection = true;
+        continue;
+      }
+      const key = `${file.name}:${file.size}:${file.lastModified}`;
+      if (existingKeys.has(key)) {
+        failures.push(`${file.name}: Duplicate file selection skipped.`);
+        continue;
+      }
+      existingKeys.add(key);
+      candidates.push(file);
+    }
+
+    setFileInputKey((key) => key + 1);
+    setRetryImageSelection(canRetrySelection);
+    setError(failures.join(" "));
+    if (!candidates.length) return;
+
+    setProcessingImages(true);
     void (async () => {
-      // Keep analysis sequential to avoid a burst of image-decoding memory on phones.
-      for (const photo of additions) {
+      // Read, copy and decode one image at a time to avoid a burst of full-size phone images in memory.
+      while (candidates.length) {
+        const selectedFile = candidates.shift()!;
         try {
-          const { estimate, width, height, hasTransparency } = await analyzeProductImage(photo.file!);
+          const stableFile = await createStableProductImage(selectedFile);
+          const { estimate, width, height, hasTransparency } = await analyzeProductImage(stableFile);
           const suggestion = suggestProductCrop(estimate.bounds, estimate.confidence, width, height);
-          setPhotos((current) => current.map((item) => item.id === photo.id
-            ? {
-              ...item,
-              imageWidth: width,
-              imageHeight: height,
-              subjectBounds: estimate.bounds,
-              cropConfidence: estimate.confidence,
-              cropReason: estimate.reason,
-              imageHasTransparency: hasTransparency,
-              cropAnalysisState: "ready",
-              cropX: suggestion.x,
-              cropY: suggestion.y,
-              cropZoom: suggestion.zoom,
-              cropMode: suggestion.mode,
-              cropConfirmed: estimate.confidence === "high",
-            }
-            : item));
+          const photo: Photo = {
+            id: crypto.randomUUID(),
+            url: URL.createObjectURL(stableFile),
+            file: stableFile,
+            alt: form.name || stableFile.name,
+            cropX: suggestion.x,
+            cropY: suggestion.y,
+            cropZoom: suggestion.zoom,
+            cropMode: suggestion.mode,
+            cropConfirmed: estimate.confidence === "high",
+            cropAnalysisState: "ready",
+            cropConfidence: estimate.confidence,
+            cropReason: estimate.reason,
+            subjectBounds: estimate.bounds,
+            imageWidth: width,
+            imageHeight: height,
+            imageHasTransparency: hasTransparency,
+          };
+          setPhotos((current) => [...current, photo]);
+          setCropPhotoId((current) => current ?? photo.id);
         } catch (caught) {
-          setPhotos((current) => current.map((item) => item.id === photo.id
-            ? {
-              ...item,
-              cropAnalysisState: "failed",
-              cropConfidence: "low",
-              cropReason: caught instanceof Error ? caught.message : "Local visual analysis was unavailable. Use the full-photo fit or adjust the crop manually.",
-              cropMode: "contain",
-              cropConfirmed: false,
-            }
-            : item));
+          const stage = caught instanceof ProductImageFileError ? "Reading selected image" : "Analysing image";
+          const detail = caught instanceof Error ? caught.message : String(caught);
+          failures.push(`${selectedFile.name}: ${stage} failed. ${detail} Select the image again to retry.`);
+          canRetrySelection = true;
         }
       }
+      setRetryImageSelection(canRetrySelection);
+      setError(failures.join(" "));
+      setProcessingImages(false);
     })();
   }
 
@@ -423,6 +433,7 @@ export default function ProductEditorPage() {
         continue;
       }
       setUploadProgress({ complete, total: filePhotos.length, current: selectedFile.name });
+      let failureStage = "Generating product-card image";
       try {
         const prepared = await prepareProductImages(selectedFile, {
           x: photo.cropX ?? 0.5,
@@ -436,6 +447,7 @@ export default function ProductEditorPage() {
         const cardPath = photo.cardUploadPath || `${user.id}/${photo.id}${PRODUCT_CARD_IMAGE_SUFFIX}.${cardExtension}`;
         let originalUrl = photo.uploadedUrl;
         if (!originalUrl) {
+          failureStage = "Uploading original image";
           setPhotos((current) => current.map((item) => item.id === photo.id
             ? { ...item, uploadPath: originalPath, uploadStatus: "uploading", uploadError: undefined }
             : item));
@@ -447,6 +459,7 @@ export default function ProductEditorPage() {
 
         let cardUrl = photo.cardUploadedUrl;
         if (!cardUrl) {
+          failureStage = "Uploading card rendition";
           setPhotos((current) => current.map((item) => item.id === photo.id
             ? { ...item, uploadPath: originalPath, uploadedUrl: originalUrl, cardUploadPath: cardPath, uploadStatus: "uploading", uploadError: undefined }
             : item));
@@ -459,11 +472,13 @@ export default function ProductEditorPage() {
         complete += 1;
         setUploadProgress({ complete, total: filePhotos.length, current: "" });
       } catch (caught) {
-        const reason = describeImageUploadError(caught);
+        const stage = caught instanceof ProductImageFileError ? "Reading selected image" : failureStage;
+        const detail = stage.startsWith("Uploading") ? describeImageUploadError(caught) : safeError(caught);
+        const reason = `${stage} failed. ${detail}`;
         setPhotos((current) => current.map((item) => item.id === photo.id
           ? { ...item, uploadStatus: "failed", uploadError: reason }
           : item));
-        throw new Error(`Image “${selectedFile.name}” failed: ${reason}`);
+        throw new Error(`Image “${selectedFile.name}”: ${reason} Use the retry button to continue without losing the product form or other selected images.`);
       }
     }
     return { photos: output };
@@ -472,6 +487,7 @@ export default function ProductEditorPage() {
   async function save(action: "draft" | "published" | "current", event?: FormEvent) {
     event?.preventDefault();
     if (savingRef.current) return;
+    if (processingImages) { setError("Wait for selected images to finish reading and analysis. Your product details and successfully checked images remain in the form."); return; }
     setError("");
     setSuccess("");
     if (!form.name.trim()) { setError("Product name is required."); return; }
@@ -650,8 +666,9 @@ export default function ProductEditorPage() {
       <Link href="/products" className="button ghost"><ArrowLeft size={15}/>Back to products</Link>
     </div>
     {!SUPABASE_CONFIGURED && <div className="notice warn" style={{ marginBottom: 15 }}>Add Supabase public connection variables before editing catalogue data.</div>}
-    {error && <div className="notice error" role="alert" style={{ marginBottom: 15 }}>{error}</div>}
+    {error && <div className="notice error" role="alert" style={{ marginBottom: 15 }}>{error}{retryImageSelection && !processingImages && <button className="button small ghost" type="button" style={{ marginLeft: 10 }} onClick={() => fileInputRef.current?.click()}>Select image again</button>}</div>}
     {success && <div className="notice success" role="status" style={{ marginBottom: 15 }}><Check size={17}/>{success}</div>}
+    {processingImages && <div className="helper" role="status" style={{ marginBottom: 15 }}>Reading selected image bytes, making stable copies and checking each image sequentially…</div>}
 
     <form onSubmit={(event) => void save("draft", event)} className="stack">
       <div className="two-col">
@@ -677,7 +694,7 @@ export default function ProductEditorPage() {
 
           <section className="card">
             <div className="section-title"><h2>Product photos</h2><span className="tag">Use permitted images · 5 MB max per stored version</span></div>
-            <label className="select-photo"><ImagePlus size={25}/><b>Tap to add product photos</b><span className="tag">JPEG, PNG, WebP or AVIF · local visual estimate (not semantic AI) · exact 1600 × 1200 card rendition; original gallery photo stays uncropped</span><input key={fileInputKey} type="file" accept="image/jpeg,image/png,image/webp,image/avif" multiple onChange={addFiles} disabled={saving} style={{ display: "none" }} /></label>
+            <label className="select-photo"><ImagePlus size={25}/><b>Tap to add product photos</b><span className="tag">JPEG, PNG, WebP or AVIF · local visual estimate (not semantic AI) · exact 1600 × 1200 card rendition; original gallery photo stays uncropped</span><input ref={fileInputRef} key={fileInputKey} type="file" accept="image/jpeg,image/png,image/webp,image/avif" multiple onChange={addFiles} disabled={saving || processingImages} style={{ display: "none" }} /></label>
             <div className="actions" style={{ marginTop: 10 }}><input className="input" value={urlInput} onChange={(event) => setUrlInput(event.target.value)} placeholder="Add a public HTTPS image URL" disabled={saving} /><button className="button" type="button" onClick={addUrl} disabled={saving}><Link2 size={14}/>Add URL</button></div>
             {externalImageCount > 0 && <div className="notice warn" style={{ marginTop: 10 }}><Link2 size={15}/><span>{externalImageCount} image{externalImageCount === 1 ? " is" : "s are"} still hosted outside NEXTVO Storage and may disappear if the source URL changes. Copy permitted images into Storage using Import, or confirm this external source is permitted and that you understand the availability risk.</span></div>}
             {externalImageCount > 0 && <label className="checkbox" style={{ marginTop: 9 }}><input type="checkbox" checked={externalImagesConfirmed} onChange={(event) => setExternalImagesConfirmed(event.target.checked)} /> I have permission to use these external image URLs and understand they depend on the source website.</label>}
@@ -745,7 +762,7 @@ export default function ProductEditorPage() {
             {photos.filter((photo) => photo.uploadError).map((photo) => <p key={`${photo.id}-error`} role="alert" className="field-note" style={{ color: "#ffb1b1", marginTop: 8 }}>{photo.file?.name}: {photo.uploadError}</p>)}
             {uploadProgress.total > 0 && <div role="status" className="helper" style={{ marginTop: 10 }}><LoaderCircle size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />Uploading image {uploadProgress.complete + 1} of {uploadProgress.total}{uploadProgress.current ? `: ${uploadProgress.current}` : ""}…</div>}
             {!saving && retryAction && saveOutcomeUncertain && <button className="button ghost" type="button" style={{ marginTop: 10 }} onClick={() => void save(retryAction)}><Save size={14}/>Retry save with retained images</button>}
-            {!saving && retryAction && photos.some((photo) => photo.uploadStatus === "failed") && <button className="button ghost" type="button" style={{ marginTop: 10 }} onClick={() => void save(retryAction)}><ImagePlus size={14}/>Retry failed image uploads</button>}
+            {!saving && retryAction && photos.some((photo) => photo.uploadStatus === "failed") && <button className="button ghost" type="button" style={{ marginTop: 10 }} onClick={() => void save(retryAction)}><ImagePlus size={14}/>Retry failed image stages</button>}
           </section>
 
           <section className="card">
@@ -772,9 +789,9 @@ export default function ProductEditorPage() {
           </div></section>
           <section className="card"><div className="section-title"><h2>Share preview</h2></div><div style={{ display: "grid", gap: 12 }}><div className="product-cell">{photos[0]?.url ? <img className="product-thumb" src={photos[0].url} alt=""/> : <div className="product-thumb empty"><ImagePlus size={18}/></div>}<div><b>{form.name || "Your product name"}</b><div className="tag">{form.price ? formatMoney(form.price, "NGN") : "Selling price (NGN)"}</div></div></div><div className="notice"><Link2 size={15}/><span>{STOREFRONT_URL ? `${STOREFRONT_URL}/products/${slugify(form.slug || form.name) || "product-name"}` : "Set NEXT_PUBLIC_STOREFRONT_URL to generate public links."}</span></div></div></section>
           <div className="actions" style={{ flexDirection: "column", alignItems: "stretch" }}>
-            <button className="button" type="submit" disabled={saving || !SUPABASE_CONFIGURED}><Save size={15}/>{saving ? "Saving…" : "Save draft"}</button>
-            <button className="button ghost" type="button" disabled={saving || !SUPABASE_CONFIGURED} onClick={() => void save("current")}>{saving ? "Saving…" : "Save changes"}</button>
-            <button className="button primary" type="button" disabled={saving || !SUPABASE_CONFIGURED} onClick={() => void save("published")}><Check size={15}/>{saving ? "Publishing…" : "Publish product"}</button>
+            <button className="button" type="submit" disabled={saving || processingImages || !SUPABASE_CONFIGURED}><Save size={15}/>{saving ? "Saving…" : processingImages ? "Checking images…" : "Save draft"}</button>
+            <button className="button ghost" type="button" disabled={saving || processingImages || !SUPABASE_CONFIGURED} onClick={() => void save("current")}>{saving ? "Saving…" : processingImages ? "Checking images…" : "Save changes"}</button>
+            <button className="button primary" type="button" disabled={saving || processingImages || !SUPABASE_CONFIGURED} onClick={() => void save("published")}><Check size={15}/>{saving ? "Publishing…" : processingImages ? "Checking images…" : "Publish product"}</button>
             {saving && <div className="helper" style={{ textAlign: "center" }}><LoaderCircle size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />{uploadProgress.total > 0 ? `Uploading images ${uploadProgress.complete}/${uploadProgress.total}…` : "Wait for database confirmation."}</div>}
           </div>
         </aside>

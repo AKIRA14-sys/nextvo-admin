@@ -1,5 +1,6 @@
-import { MAX_PRODUCT_IMAGE_BYTES, sniffProductImageMime } from "./image-validation";
+import { MAX_PRODUCT_IMAGE_BYTES } from "./image-validation";
 import type { ProductCropOptions } from "./product-image-detection";
+import { createStableProductImage } from "./product-image-file";
 
 export const MAX_PRODUCT_IMAGE_SOURCE_BYTES = 30 * 1024 * 1024;
 export const PRODUCT_CARD_IMAGE_SUFFIX = "-nextvo-card";
@@ -133,16 +134,29 @@ async function decodeOrientedImage(file: File): Promise<ImageBitmap> {
   if (typeof createImageBitmap !== "function") {
     throw new Error("This browser cannot process the selected image. Choose another image or use a modern browser.");
   }
+  let firstError: unknown;
   try {
     // Explicitly apply EXIF orientation before dimension detection and cropping.
     return await createImageBitmap(file, { imageOrientation: "from-image" });
-  } catch {
+  } catch (error) {
+    firstError = error;
     // Older browsers may reject the options dictionary; their default is from-image.
-    try {
-      return await createImageBitmap(file);
-    } catch {
-      throw new Error("This browser could not read the selected image for resizing. Choose another image or retry in a modern browser.");
-    }
+  }
+  try {
+    return await createImageBitmap(file);
+  } catch (error) {
+    const failure = [firstError, error].find((item) => item && typeof item === "object" &&
+      "name" in item && ["NotReadableError", "NotFoundError", "SecurityError", "NotAllowedError"].includes(String(item.name))) || error;
+    const name = failure && typeof failure === "object" && "name" in failure ? String(failure.name) : "";
+    const detail = failure && typeof failure === "object" && "message" in failure ? String(failure.message) : "";
+    const explanation = name === "NotFoundError"
+      ? "The selected image is no longer available to the browser."
+      : name === "SecurityError" || name === "NotAllowedError"
+        ? "The browser denied access to the image while decoding it."
+        : name === "NotReadableError"
+          ? "The browser could not read the image while decoding it."
+          : "The browser could not decode the stable image copy.";
+    throw new Error(`${explanation}${name ? ` (${name})` : ""}${detail ? ` ${detail}` : ""} Select the image again or choose another supported image.`);
   }
 }
 
@@ -281,21 +295,17 @@ export async function prepareProductImages(
     throw new Error("This image is too large to process on this device (maximum source size: 30 MB).");
   }
 
-  const header = new Uint8Array(await file.slice(0, 32).arrayBuffer());
-  const actualMime = sniffProductImageMime(header);
-  if (!actualMime) throw new Error("Unsupported image format. Choose a valid JPEG, PNG, WebP or AVIF image.");
-  if (file.type && file.type !== actualMime && file.type !== "application/octet-stream") {
-    throw new Error("The selected file type does not match its image data. Choose a valid JPEG, PNG, WebP or AVIF image.");
-  }
+  const stableFile = await createStableProductImage(file);
+  const actualMime = stableFile.type;
 
-  const bitmap = await decodeOrientedImage(file);
+  const bitmap = await decodeOrientedImage(stableFile);
   try {
     if (!bitmap.width || !bitmap.height) throw new Error("The selected image has invalid dimensions.");
     const preserveAlpha = bitmapHasTransparency(bitmap, actualMime);
-    const original = file.size <= MAX_PRODUCT_IMAGE_BYTES
-      ? new File([file], withImageExtension(file.name, imageExtension(actualMime)), { type: actualMime, lastModified: file.lastModified })
-      : await renderFullFrame(bitmap, file, actualMime, preserveAlpha);
-    const card = await renderCardFrame(bitmap, file, actualMime, crop, preserveAlpha);
+    const original = stableFile.size <= MAX_PRODUCT_IMAGE_BYTES
+      ? new File([stableFile], withImageExtension(stableFile.name, imageExtension(actualMime)), { type: actualMime, lastModified: stableFile.lastModified })
+      : await renderFullFrame(bitmap, stableFile, actualMime, preserveAlpha);
+    const card = await renderCardFrame(bitmap, stableFile, actualMime, crop, preserveAlpha);
     return { original, card, width: bitmap.width, height: bitmap.height };
   } finally {
     bitmap.close();
