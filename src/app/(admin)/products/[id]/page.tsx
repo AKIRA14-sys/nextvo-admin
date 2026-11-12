@@ -173,7 +173,7 @@ export default function ProductEditorPage() {
       const details = detailsResult.data || {};
       const attrs = (product.attributes && typeof product.attributes === "object" ? product.attributes : {}) as Record<string, unknown>;
       const imageSources = readImageSources(details.source_image_urls);
-      const imageRows = ((imagesResult.data || []) as Array<{ image_url: string; alt_text: string | null }>)
+      const imageRows: Photo[] = ((imagesResult.data || []) as Array<{ image_url: string; alt_text: string | null }>)
         .filter((image) => !isProductCardImageUrl(image.image_url))
         .map((image) => {
         const metadata = imageSources.get(image.image_url);
@@ -181,7 +181,10 @@ export default function ProductEditorPage() {
       });
       if (product.image_url && isProductCardImageUrl(product.image_url)) {
         if (imageRows[0]) imageRows[0].cardUrl = product.image_url;
-        else imageRows.push({ id: crypto.randomUUID(), url: product.image_url, cardUrl: product.image_url, alt: product.name });
+        else {
+          const metadata = [...imageSources.values()].find((entry) => entry.cardUrl === product.image_url);
+          imageRows.push({ id: crypto.randomUUID(), url: product.image_url, sourceUrl: metadata?.sourceUrl, cardUrl: product.image_url, alt: product.name });
+        }
       } else if (product.image_url && !imageRows.some((image: Photo) => image.url === product.image_url)) {
         const metadata = imageSources.get(product.image_url);
         imageRows.unshift({ id: crypto.randomUUID(), url: product.image_url, sourceUrl: metadata?.sourceUrl, cardUrl: metadata?.cardUrl, alt: product.name });
