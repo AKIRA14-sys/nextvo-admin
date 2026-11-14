@@ -3,16 +3,20 @@
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { ArrowLeft, ArrowDown, ArrowUp, Check, Crop, ImagePlus, Link2, LoaderCircle, Plus, Save, Trash2 } from "lucide-react";
+import { ArrowLeft, ArrowDown, ArrowUp, Check, Crop, ExternalLink, ImagePlus, Link2, LoaderCircle, PackagePlus, Plus, Save, Trash2 } from "lucide-react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { STOREFRONT_URL, SUPABASE_CONFIGURED, SUPABASE_URL } from "@/lib/supabase/config";
-import { mergeProductAttributes, resolveProductStatus, validateSupplierCost } from "@/lib/product-domain";
+import { resolveProductStatus, validateSupplierCost } from "@/lib/product-domain";
 import { analyzeProductImage, suggestProductCrop, type DetectionConfidence, type NormalizedRect, type ProductCropOptions } from "@/lib/product-image-detection";
 import { createStableProductImage, ProductImageFileError } from "@/lib/product-image-file";
 import { describeImageUploadError, getProductCardSourceRegion, isProductCardImageUrl, MAX_PRODUCT_IMAGE_SOURCE_BYTES, prepareProductImages, PRODUCT_CARD_IMAGE_SUFFIX } from "@/lib/product-image-processing";
 import { formatMoney, safeError, slugify } from "@/lib/format";
+import { normalizeFeatures, templateForSubcategory } from "@/lib/product-specifications";
+import { buildPublicProductAttributes, buildSpecificationAttributes, readSpecificationDraft, type CustomSpecificationDraft } from "@/lib/product-editor-data";
+import { PRODUCT_HANDOFF_SESSION_KEY, validateProductHandoffPayload, type HandoffVariation, type ProductHandoff } from "@/lib/product-handoff";
 
 const NEW = "new";
+const PRIVATE_METADATA_MIGRATION = "supabase/migrations/20261114125700_nextvo_private_product_source_metadata.sql";
 type Category = { id: string; slug: string; name: string; active: boolean; subcategories?: { id: string; slug: string; name: string; active: boolean }[] };
 type Photo = {
   id: string;
@@ -56,16 +60,17 @@ type ProductForm = {
   supplier_url: string;
   supplier_price: string;
   supplier_currency: string;
+  local_sourcing_cost: string;
   status: string;
   featured: boolean;
   new_arrival: boolean;
 };
 
-const blankVariant: Variant = { label: "", sku: "", price: "", stock: "0", options: "" };
+const blankVariant: Variant = { label: "", sku: "", price: "", stock: "", options: "" };
 const initialForm: ProductForm = {
   name: "", slug: "", description: "", short_description: "", category_id: "", subcategory_id: "", brand: "",
-  price: "", compare: "", stock: "0", supplier_name: "", supplier_url: "", supplier_price: "",
-  supplier_currency: "NGN", status: "draft", featured: false, new_arrival: false,
+  price: "", compare: "", stock: "", supplier_name: "", supplier_url: "", supplier_price: "",
+  supplier_currency: "NGN", local_sourcing_cost: "", status: "draft", featured: false, new_arrival: false,
 };
 
 function parseOptions(value: string) {
@@ -109,6 +114,30 @@ function readImageSources(value: unknown): Map<string, ImageMetadata> {
   return sources;
 }
 
+function readVariationHints(value: unknown): HandoffVariation[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 40).flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const entry = item as Record<string, unknown>;
+    const name = typeof entry.name === "string" ? entry.name.trim().slice(0, 80) : "";
+    const values = Array.isArray(entry.values) ? Array.from(new Set(entry.values.filter((value): value is string => typeof value === "string" && value.trim().length > 0).map((value) => value.trim().slice(0, 100)))).slice(0, 50) : [];
+    return name && values.length ? [{ name, values }] : [];
+  });
+}
+
+function readSourceRecords(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item))).slice(0, 8);
+}
+
+function safeSupplierSourceUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password ? url.toString() : null;
+  } catch { return null; }
+}
+
 export default function ProductEditorPage() {
   const params = useParams<{ id: string }>();
   const id = params.id;
@@ -119,17 +148,26 @@ export default function ProductEditorPage() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const [handoffNotice, setHandoffNotice] = useState("");
+  const [privateFieldsReady, setPrivateFieldsReady] = useState(false);
+  const [privateSchemaError, setPrivateSchemaError] = useState("");
   const [categories, setCategories] = useState<Category[]>([]);
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [fileInputKey, setFileInputKey] = useState(0);
   const [cropPhotoId, setCropPhotoId] = useState<string | null>(null);
-  const [specifications, setSpecifications] = useState("");
+  const [specificationValues, setSpecificationValues] = useState<Record<string, string>>({});
+  const [specificationUnits, setSpecificationUnits] = useState<Record<string, string>>({});
+  const [customSpecifications, setCustomSpecifications] = useState<CustomSpecificationDraft[]>([]);
+  const [keyFeatures, setKeyFeatures] = useState<string[]>([]);
+  const [featureInput, setFeatureInput] = useState("");
+  const [variationHints, setVariationHints] = useState<HandoffVariation[]>([]);
   const [variantList, setVariantList] = useState<Variant[]>([]);
   const [urlInput, setUrlInput] = useState("");
   const [form, setForm] = useState<ProductForm>(initialForm);
-  const [originalAttributes, setOriginalAttributes] = useState<Record<string, unknown>>({});
+  const [originalSourceData, setOriginalSourceData] = useState<Record<string, unknown>>({});
   const [originalSearchTerms, setOriginalSearchTerms] = useState<string[]>([]);
   const [externalImagesConfirmed, setExternalImagesConfirmed] = useState(false);
+  const [copyingSupplierImages, setCopyingSupplierImages] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ complete: 0, total: 0, current: "" });
   const [retryAction, setRetryAction] = useState<"draft" | "published" | "current" | null>(null);
   const [processingImages, setProcessingImages] = useState(false);
@@ -154,7 +192,37 @@ export default function ProductEditorPage() {
     () => categories.find((category) => category.id === form.category_id)?.subcategories?.filter((subcategory) => subcategory.active) || [],
     [categories, form.category_id],
   );
+  const selectedCategory = categories.find((category) => category.id === form.category_id);
+  const selectedSubcategory = selectedCategory?.subcategories?.find((subcategory) => subcategory.id === form.subcategory_id);
+  const specificationFields = useMemo(
+    () => templateForSubcategory(selectedCategory?.slug, selectedSubcategory?.slug).filter((field) => field.key !== "brand"),
+    [selectedCategory?.slug, selectedSubcategory?.slug],
+  );
+  useEffect(() => {
+    if (!specificationFields.length || !customSpecifications.length) return;
+    const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const consumed = new Set<string>();
+    const migrations = customSpecifications.flatMap((row) => {
+      const match = specificationFields.find((field) => normalize(field.key) === normalize(row.label) || normalize(field.label) === normalize(row.label));
+      if (!match) return [];
+      consumed.add(row.id);
+      let value = row.value;
+      let unit = "";
+      if (match.type === "measurement") {
+        unit = match.units?.find((candidate) => value.trim().endsWith(` ${candidate}`)) || "";
+        if (unit) value = value.trim().slice(0, -unit.length).trim();
+      } else if (match.type === "boolean") {
+        value = /^(yes|true)$/i.test(value.trim()) ? "true" : /^(no|false)$/i.test(value.trim()) ? "false" : value;
+      }
+      return [{ key: match.key, value, unit }];
+    });
+    if (!migrations.length) return;
+    setSpecificationValues((current) => ({ ...current, ...Object.fromEntries(migrations.map(({ key, value }) => [key, value])) }));
+    setSpecificationUnits((current) => ({ ...current, ...Object.fromEntries(migrations.filter((entry) => entry.unit).map(({ key, unit }) => [key, unit])) }));
+    setCustomSpecifications((current) => current.filter((row) => !consumed.has(row.id)));
+  }, [customSpecifications, specificationFields]);
   const externalImageCount = photos.filter((photo) => !isManagedStorageUrl(photo.url) && !photo.file).length;
+  const pendingSupplierImages = photos.filter((photo) => photo.sourceUrl && !isManagedStorageUrl(photo.url) && !photo.file);
   const cropPhoto = photos.find((photo) => photo.id === cropPhotoId && photo.file);
   const cropOptions: ProductCropOptions | null = cropPhoto ? {
     x: cropPhoto.cropX ?? 0.5,
@@ -187,8 +255,63 @@ export default function ProductEditorPage() {
         .select("id,slug,name,active,subcategories(id,slug,name,active)").order("display_order");
       if (!live) return;
       if (categoryError) setError(`Could not read categories: ${safeError(categoryError)}`);
-      else setCategories((categoryData || []) as Category[]);
-      if (isNew) { setLoading(false); return; }
+      const categoryRows = (categoryData || []) as Category[];
+      if (!categoryError) setCategories(categoryRows);
+
+      const { error: privateSchemaCheckError } = await db.from("nextvo_admin_product_details")
+        .select("local_sourcing_cost_ngn,source_data").limit(0);
+      if (!live) return;
+      if (privateSchemaCheckError) {
+        setPrivateFieldsReady(false);
+        setPrivateSchemaError(`Apply ${PRIVATE_METADATA_MIGRATION} to this Supabase project before saving supplier reference details, local sourcing cost or original source records. ${safeError(privateSchemaCheckError)}`);
+      } else {
+        setPrivateFieldsReady(true);
+        setPrivateSchemaError("");
+      }
+
+      if (isNew) {
+        const handoffRequested = new URLSearchParams(window.location.search).get("handoff") === "1";
+        if (handoffRequested) {
+          let rawDraft: string | null = null;
+          try { rawDraft = window.sessionStorage.getItem(PRODUCT_HANDOFF_SESSION_KEY); } catch { /* storage may be disabled */ }
+          try { window.sessionStorage.removeItem(PRODUCT_HANDOFF_SESSION_KEY); } catch { /* consume-once best effort */ }
+          let draft: ProductHandoff | null = null;
+          try { draft = rawDraft ? validateProductHandoffPayload(JSON.parse(rawDraft)) : null; } catch { draft = null; }
+          if (!draft) {
+            setError("The shared draft is missing, invalid or expired. Return to the Android app and share a fresh draft; no product was saved.");
+          } else {
+            const title = draft.product.title || "";
+            const firstSource = draft.sources[0];
+            setHandoffNotice(`Received ${draft.sources.length} supplier source${draft.sources.length === 1 ? "" : "s"}. Review this information and explicitly save an unpublished draft when ready.`);
+            setForm({
+              ...initialForm,
+              name: title,
+              slug: slugify(title),
+              description: draft.product.description || "",
+              brand: draft.product.brand || "",
+              stock: "",
+              supplier_name: firstSource?.seller || firstSource?.supplier_host || "",
+              supplier_url: firstSource?.url || "",
+              supplier_price: draft.product.supplier_reference_price || "",
+              supplier_currency: draft.product.supplier_reference_currency || "NGN",
+              status: "draft",
+            });
+            setPhotos(draft.product.images.map((image) => ({
+              id: crypto.randomUUID(),
+              url: image,
+              sourceUrl: draft.product.image_sources[image] || image,
+              alt: title,
+            })));
+            setKeyFeatures(draft.product.features);
+            setCustomSpecifications(Object.entries(draft.product.specifications).map(([label, value], index) => ({ id: `handoff-${index}`, label, value })));
+            setVariationHints(draft.product.variations);
+            setVariantList(draft.product.sku ? [{ ...blankVariant, label: "Default", sku: draft.product.sku, stock: "" }] : []);
+            setOriginalSourceData({ schema: draft.schema, draft_id: draft.draft_id, created_at: draft.created_at, expires_at: draft.expires_at, import_history_id: draft.sources.find((source) => source.history_id)?.history_id || null, sources: draft.sources, product: draft.product });
+          }
+        }
+        setLoading(false);
+        return;
+      }
 
       const { data: product, error: productError } = await db.from("products").select("*").eq("id", id).single();
       if (!live) return;
@@ -206,6 +329,10 @@ export default function ProductEditorPage() {
       if (detailsResult.error) setError(`Admin SQL setup is required: ${safeError(detailsResult.error)}`);
       const details = detailsResult.data || {};
       const attrs = (product.attributes && typeof product.attributes === "object" ? product.attributes : {}) as Record<string, unknown>;
+      const productCategory = categoryRows.find((category) => category.id === product.category_id);
+      const productSubcategory = productCategory?.subcategories?.find((subcategory) => subcategory.id === product.subcategory_id);
+      const productFields = templateForSubcategory(productCategory?.slug, productSubcategory?.slug).filter((field) => field.key !== "brand");
+      const specificationDraft = readSpecificationDraft(attrs, productFields);
       const imageSources = readImageSources(details.source_image_urls);
       const imageRows: Photo[] = ((imagesResult.data || []) as Array<{ image_url: string; alt_text: string | null }>)
         .filter((image) => !isProductCardImageUrl(image.image_url))
@@ -225,7 +352,11 @@ export default function ProductEditorPage() {
       }
       setPhotos(imageRows);
       setCropPhotoId(null);
-      setOriginalAttributes(attrs);
+      setOriginalSourceData(details.source_data && typeof details.source_data === "object" && !Array.isArray(details.source_data) ? details.source_data as Record<string, unknown> : {});
+      const sourceData = details.source_data && typeof details.source_data === "object" && !Array.isArray(details.source_data) ? details.source_data as Record<string, unknown> : {};
+      const sourceProduct = sourceData.product && typeof sourceData.product === "object" && !Array.isArray(sourceData.product) ? sourceData.product as Record<string, unknown> : {};
+      const sourceVariations = readVariationHints(sourceProduct.variations);
+      setVariationHints(sourceVariations.length ? sourceVariations : readSourceRecords(sourceData.sources).flatMap((source) => readVariationHints(source.variations)));
       setOriginalSearchTerms(Array.isArray(product.search_terms) ? product.search_terms.map(String) : []);
       setExternalImagesConfirmed(false);
       setForm({
@@ -243,12 +374,15 @@ export default function ProductEditorPage() {
         supplier_url: details.supplier_product_url || "",
         supplier_price: details.supplier_price == null ? "" : String(details.supplier_price),
         supplier_currency: details.supplier_currency || "NGN",
+        local_sourcing_cost: details.local_sourcing_cost_ngn == null ? "" : String(details.local_sourcing_cost_ngn),
         status: details.status || (product.active ? "published" : "unpublished"),
         featured: product.featured === true,
         new_arrival: product.is_new_arrival === true,
       });
-      setSpecifications(Object.entries(attrs).filter(([key]) => key !== "short_description")
-        .map(([key, value]) => `${key}: ${Array.isArray(value) ? value.map(String).join(", ") : value && typeof value === "object" ? JSON.stringify(value) : String(value)}`).join("\n"));
+      setKeyFeatures(normalizeFeatures(attrs.key_features));
+      setSpecificationValues(specificationDraft.values);
+      setSpecificationUnits(specificationDraft.units);
+      setCustomSpecifications(specificationDraft.custom);
       setVariantList(((variantsResult.data || []) as Array<{ id: string; label: string; sku: string | null; price_ngn: number | null; stock_quantity: number; options: Record<string, unknown> }>).map((variant) => ({
         id: variant.id,
         label: variant.label || "",
@@ -265,6 +399,54 @@ export default function ProductEditorPage() {
 
   function change<K extends keyof ProductForm>(key: K, value: ProductForm[K]) {
     setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function preserveSpecificationsBeforeCategoryChange() {
+    const previousValues = specificationFields.flatMap((field) => {
+      const value = specificationValues[field.key]?.trim();
+      if (!value) return [];
+      const unit = specificationUnits[field.key]?.trim() || field.unit || "";
+      const formatted = field.type === "measurement" && unit ? `${value} ${unit}` : value;
+      return [{ id: crypto.randomUUID(), label: field.label, value: formatted }];
+    });
+    setCustomSpecifications((current) => {
+      const existing = new Set(current.map((row) => row.label.toLowerCase().replace(/[^a-z0-9]/g, "")));
+      return [...current, ...previousValues.filter((row) => {
+        const key = row.label.toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (existing.has(key)) return false;
+        existing.add(key);
+        return true;
+      })];
+    });
+    setSpecificationValues({});
+    setSpecificationUnits({});
+  }
+
+  function changeCategory(categoryId: string) {
+    preserveSpecificationsBeforeCategoryChange();
+    change("category_id", categoryId);
+    change("subcategory_id", "");
+  }
+
+  function changeSubcategory(subcategoryId: string) {
+    preserveSpecificationsBeforeCategoryChange();
+    change("subcategory_id", subcategoryId);
+  }
+
+  function addFeature() {
+    const feature = featureInput.trim();
+    if (!feature) return;
+    setKeyFeatures((current) => normalizeFeatures([...current, feature]));
+    setFeatureInput("");
+  }
+
+  function addVariationHintAsVariants(hint: HandoffVariation) {
+    const additions = hint.values.slice(0, 20).map((value) => ({
+      ...blankVariant,
+      label: value,
+      options: `${hint.name}=${value}`,
+    }));
+    setVariantList((current) => [...current, ...additions]);
   }
 
   function addFiles(event: ChangeEvent<HTMLInputElement>) {
@@ -393,6 +575,36 @@ export default function ProductEditorPage() {
     }
   }
 
+  async function copySupplierImagesToStorage() {
+    if (!pendingSupplierImages.length || copyingSupplierImages || saving) return;
+    if (!externalImagesConfirmed) {
+      setError("Confirm that you have permission to reuse the selected supplier images before copying them into NEXTVO Storage.");
+      return;
+    }
+    setCopyingSupplierImages(true);
+    setError("");
+    const failures: string[] = [];
+    for (const photo of pendingSupplierImages) {
+      try {
+        const sourceUrl = photo.sourceUrl || photo.url;
+        const response = await fetch("/api/import/image", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: sourceUrl, rightsConfirmed: true }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Image copy failed.");
+        if (typeof data.image_url !== "string" || !isManagedStorageUrl(data.image_url)) throw new Error("The image copy did not return a NEXTVO Storage URL.");
+        setPhotos((current) => current.map((item) => item.id === photo.id ? { ...item, url: data.image_url, sourceUrl } : item));
+      } catch (caught) {
+        failures.push(`${photo.sourceUrl || photo.url}: ${safeError(caught)}`);
+      }
+    }
+    setCopyingSupplierImages(false);
+    setExternalImagesConfirmed(false);
+    if (failures.length) setError(`Some supplier images were not copied. They remain unsaved and can be retried or removed. ${failures.join("; ")}`);
+  }
+
   async function uploadFiles() {
     const db = getSupabaseBrowserClient();
     const { data: { user }, error: authError } = await db.auth.getUser();
@@ -487,6 +699,8 @@ export default function ProductEditorPage() {
   async function save(action: "draft" | "published" | "current", event?: FormEvent) {
     event?.preventDefault();
     if (savingRef.current) return;
+    if (copyingSupplierImages) { setError("Wait for supplier images to finish copying into NEXTVO Storage before saving."); return; }
+    if (!privateFieldsReady) { setError(`Apply ${PRIVATE_METADATA_MIGRATION} to this Supabase project before saving; this editor requires its private source metadata fields and updated save function.`); return; }
     if (processingImages) { setError("Wait for selected images to finish reading and analysis. Your product details and successfully checked images remain in the form."); return; }
     setError("");
     setSuccess("");
@@ -497,11 +711,14 @@ export default function ProductEditorPage() {
     const compare = form.compare.trim() ? Number(form.compare) : null;
     if (!Number.isFinite(price) || price < 0) { setError("Enter a valid NGN selling price."); return; }
     if (compare !== null && (!Number.isFinite(compare) || compare < price)) { setError("Compare-at price must be a valid NGN amount greater than or equal to the selling price."); return; }
-    if (!Number.isInteger(stock) || stock < 0) { setError("Stock must be a non-negative whole number."); return; }
+    if (!form.stock.trim() || !Number.isInteger(stock) || stock < 0) { setError("Confirm a non-negative whole-number stock quantity before saving. Source availability is not treated as NEXTVO stock."); return; }
     if (!form.category_id) { setError("Choose a department before saving."); return; }
+    if (form.subcategory_id && !subcategories.some((subcategory) => subcategory.id === form.subcategory_id)) { setError("Choose a subcategory from the selected department, or clear the subcategory."); return; }
     let supplierCost: ReturnType<typeof validateSupplierCost>;
     try { supplierCost = validateSupplierCost(form.supplier_price, form.supplier_currency); }
     catch (caught) { setError(safeError(caught)); return; }
+    const localCost = form.local_sourcing_cost.trim() ? Number(form.local_sourcing_cost) : null;
+    if (localCost !== null && (!Number.isFinite(localCost) || localCost < 0)) { setError("Local sourcing cost must be a non-negative NGN amount or left blank."); return; }
     if (form.supplier_url) {
       try {
         const supplierUrl = new URL(form.supplier_url);
@@ -512,10 +729,16 @@ export default function ProductEditorPage() {
     const slug = slugify(form.slug || form.name);
     if (!slug) { setError("Enter a product name or URL slug that produces a valid slug."); return; }
     if (externalImageCount > 0 && !externalImagesConfirmed) { setError("Confirm that externally hosted image URLs are permitted and may become unavailable, or copy permitted images into Storage."); return; }
+    if (pendingSupplierImages.length > 0) { setError("Copy each selected supplier image into NEXTVO Storage or remove it before saving. Supplier image URLs are never stored as permanent product photos."); return; }
     const analysingPhoto = photos.find((photo) => photo.file && photo.cropAnalysisState === "analysing");
     if (analysingPhoto) { setCropPhotoId(analysingPhoto.id); setError("Wait for the local image review to finish before saving. Your selected photos and product details are still in the form."); return; }
     const unconfirmedCrop = photos.find((photo) => photo.file && !photo.cropConfirmed);
     if (unconfirmedCrop) { setCropPhotoId(unconfirmedCrop.id); setError("Review and confirm every suggested crop, or choose the full-photo fit, before saving."); return; }
+    let publicAttributes: Record<string, unknown>;
+    try {
+      const structuredSpecifications = buildSpecificationAttributes(specificationFields, specificationValues, specificationUnits, customSpecifications);
+      publicAttributes = buildPublicProductAttributes(form.short_description, keyFeatures, structuredSpecifications);
+    } catch (caught) { setError(safeError(caught)); return; }
 
     setRetryAction(action);
     savingRef.current = true;
@@ -547,7 +770,7 @@ export default function ProductEditorPage() {
         featured: form.featured,
         is_new_arrival: form.new_arrival,
         active: chosenStatus === "published",
-        attributes: mergeProductAttributes(originalAttributes, specifications, form.short_description),
+        attributes: publicAttributes,
         search_terms: Array.from(new Set([...originalSearchTerms, ...form.name.toLowerCase().split(/\s+/).filter(Boolean)])),
       };
       const privateData = {
@@ -556,6 +779,8 @@ export default function ProductEditorPage() {
         supplier_product_url: form.supplier_url.trim(),
         supplier_price: supplierCost.supplierPrice,
         supplier_currency: supplierCost.supplierCurrency || "NGN",
+        local_sourcing_cost_ngn: localCost,
+        source_data: originalSourceData,
         source_image_urls: uploaded.photos.flatMap((photo) => {
           const sourceUrl = photo.sourceUrl && photo.sourceUrl !== photo.url ? photo.sourceUrl : undefined;
           const cardImageUrl = photo.cardUrl && photo.cardUrl !== photo.url ? photo.cardUrl : undefined;
@@ -576,7 +801,7 @@ export default function ProductEditorPage() {
         const variantPrice = variant.price.trim() ? Number(variant.price) : null;
         const variantStock = Number(variant.stock);
         if (variantPrice !== null && (!Number.isFinite(variantPrice) || variantPrice < 0)) throw new Error(`Enter a valid NGN price for variant “${variant.label}”.`);
-        if (!Number.isInteger(variantStock) || variantStock < 0) throw new Error(`Enter a non-negative whole stock quantity for variant “${variant.label}”.`);
+        if (!variant.stock.trim() || !Number.isInteger(variantStock) || variantStock < 0) throw new Error(`Confirm a non-negative whole stock quantity for variant “${variant.label}”; supplier availability is not treated as NEXTVO stock.`);
         return {
           ...(variant.id ? { id: variant.id } : {}),
           label: variant.label.trim(),
@@ -600,6 +825,14 @@ export default function ProductEditorPage() {
         throw saveError;
       }
       if (!savedId) throw new Error("The database did not return a saved product ID.");
+      let historyWarning = "";
+      const importHistoryId = typeof originalSourceData.import_history_id === "string" ? originalSourceData.import_history_id : null;
+      if (importHistoryId) {
+        try {
+          const { error: historyUpdateError } = await db.from("nextvo_import_history").update({ status: "saved" }).eq("id", importHistoryId);
+          if (historyUpdateError) historyWarning = " The product saved, but its import-history status did not update.";
+        } catch { historyWarning = " The product saved, but its import-history status could not be checked."; }
+      }
       uploadedPathsRef.current.clear();
       for (const photo of photosRef.current) {
         if (photo.url.startsWith("blob:")) URL.revokeObjectURL(photo.url);
@@ -619,9 +852,8 @@ export default function ProductEditorPage() {
       setCropPhotoId(null);
       setRetryAction(null);
       setSaveOutcomeUncertain(false);
-      setSuccess(chosenStatus === "published" ? "Product saved and marked published in the shared catalogue." : chosenStatus === "draft" ? "Product saved as a draft in the shared catalogue." : `Product changes saved. Current status: ${chosenStatus}.`);
+      setSuccess((chosenStatus === "published" ? "Product saved and marked published in the shared catalogue." : chosenStatus === "draft" ? "Product saved as a draft in the shared catalogue." : `Product changes saved. Current status: ${chosenStatus}.`) + historyWarning);
       setForm((current) => ({ ...current, status: chosenStatus }));
-      setOriginalAttributes(product.attributes);
       setOriginalSearchTerms(product.search_terms);
       if (isNew) {
         router.replace(`/products/${savedId}`);
@@ -659,6 +891,7 @@ export default function ProductEditorPage() {
     }
   }
 
+  const supplierSourceRecords = readSourceRecords(originalSourceData.sources);
   if (loading) return <div className="card loading-skeleton" style={{ height: 500 }} />;
   return <>
     <div className="page-heading">
@@ -668,6 +901,8 @@ export default function ProductEditorPage() {
     {!SUPABASE_CONFIGURED && <div className="notice warn" style={{ marginBottom: 15 }}>Add Supabase public connection variables before editing catalogue data.</div>}
     {error && <div className="notice error" role="alert" style={{ marginBottom: 15 }}>{error}{retryImageSelection && !processingImages && <button className="button small ghost" type="button" style={{ marginLeft: 10 }} onClick={() => fileInputRef.current?.click()}>Select image again</button>}</div>}
     {success && <div className="notice success" role="status" style={{ marginBottom: 15 }}><Check size={17}/>{success}</div>}
+    {handoffNotice && <div className="notice warn" role="status" style={{ marginBottom: 15 }}><PackagePlus size={16}/>{handoffNotice}</div>}
+    {!privateFieldsReady && <div className="notice warn" role="status" style={{ marginBottom: 15 }}>{privateSchemaError || `Apply ${PRIVATE_METADATA_MIGRATION} to this Supabase project before product saves are enabled.`}</div>}
     {processingImages && <div className="helper" role="status" style={{ marginBottom: 15 }}>Reading selected image bytes, making stable copies and checking each image sequentially…</div>}
 
     <form onSubmit={(event) => void save("draft", event)} className="stack">
@@ -680,8 +915,8 @@ export default function ProductEditorPage() {
               <div className="field full"><label htmlFor="product-slug">Product URL slug *</label><input id="product-slug" className="input" value={form.slug} onChange={(event) => change("slug", slugify(event.target.value))} placeholder="generated-from-product-name" /><span className="field-note">Share link path: /products/{slugify(form.slug || form.name) || "product-name"}. Slugs must be unique. Previously shared slugs are not redirected by this Admin app.</span></div>
               <div className="field full"><label htmlFor="short-description">Short description</label><input id="short-description" className="input" value={form.short_description} onChange={(event) => change("short_description", event.target.value)} placeholder="One-line product summary" /></div>
               <div className="field full"><label htmlFor="product-description">Description</label><textarea id="product-description" className="textarea" value={form.description} onChange={(event) => change("description", event.target.value)} placeholder="Accurate product details and relevant information" /></div>
-              <div className="field"><label htmlFor="product-category">Department *</label><select id="product-category" className="select" value={form.category_id} onChange={(event) => { change("category_id", event.target.value); change("subcategory_id", ""); }}><option value="">Choose department</option>{categories.filter((category) => category.active).map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></div>
-              <div className="field"><label htmlFor="product-subcategory">Subcategory</label><select id="product-subcategory" className="select" value={form.subcategory_id} onChange={(event) => change("subcategory_id", event.target.value)} disabled={!subcategories.length}><option value="">No subcategory</option>{subcategories.map((subcategory) => <option key={subcategory.id} value={subcategory.id}>{subcategory.name}</option>)}</select></div>
+              <div className="field"><label htmlFor="product-category">Department *</label><select id="product-category" className="select" value={form.category_id} onChange={(event) => changeCategory(event.target.value)}><option value="">Choose department</option>{categories.filter((category) => category.active).map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></div>
+              <div className="field"><label htmlFor="product-subcategory">Subcategory</label><select id="product-subcategory" className="select" value={form.subcategory_id} onChange={(event) => changeSubcategory(event.target.value)} disabled={!subcategories.length}><option value="">No subcategory</option>{subcategories.map((subcategory) => <option key={subcategory.id} value={subcategory.id}>{subcategory.name}</option>)}</select></div>
               <div className="field"><label htmlFor="product-brand">Brand (optional)</label><input id="product-brand" className="input" value={form.brand} onChange={(event) => change("brand", event.target.value)} placeholder="Brand" /></div>
               <div className="field"><label htmlFor="product-sku">SKU (internal / per variant)</label><input id="product-sku" className="input" value={variantList[0]?.sku || ""} onChange={(event) => setVariantList((variants) => variants.length ? variants.map((variant, index) => index === 0 ? { ...variant, sku: event.target.value } : variant) : [{ ...blankVariant, label: "Default", sku: event.target.value, stock: form.stock }])} placeholder="Optional SKU" /><span className="field-note">Stored on the default variant; not exposed with supplier cost.</span></div>
               <div className="field"><label htmlFor="selling-price">Selling price (NGN) *</label><input id="selling-price" className="input" type="number" min="0" step="0.01" required value={form.price} onChange={(event) => change("price", event.target.value)} placeholder="0.00" /><span className="field-note">This is the current price customers pay; it is saved to products.price_ngn.</span></div>
@@ -696,8 +931,9 @@ export default function ProductEditorPage() {
             <div className="section-title"><h2>Product photos</h2><span className="tag">Use permitted images · 5 MB max per stored version</span></div>
             <label className="select-photo"><ImagePlus size={25}/><b>Tap to add product photos</b><span className="tag">JPEG, PNG, WebP or AVIF · local visual estimate (not semantic AI) · exact 1600 × 1200 card rendition; original gallery photo stays uncropped</span><input ref={fileInputRef} key={fileInputKey} type="file" accept="image/jpeg,image/png,image/webp,image/avif" multiple onChange={addFiles} disabled={saving || processingImages} style={{ display: "none" }} /></label>
             <div className="actions" style={{ marginTop: 10 }}><input className="input" value={urlInput} onChange={(event) => setUrlInput(event.target.value)} placeholder="Add a public HTTPS image URL" disabled={saving} /><button className="button" type="button" onClick={addUrl} disabled={saving}><Link2 size={14}/>Add URL</button></div>
-            {externalImageCount > 0 && <div className="notice warn" style={{ marginTop: 10 }}><Link2 size={15}/><span>{externalImageCount} image{externalImageCount === 1 ? " is" : "s are"} still hosted outside NEXTVO Storage and may disappear if the source URL changes. Copy permitted images into Storage using Import, or confirm this external source is permitted and that you understand the availability risk.</span></div>}
-            {externalImageCount > 0 && <label className="checkbox" style={{ marginTop: 9 }}><input type="checkbox" checked={externalImagesConfirmed} onChange={(event) => setExternalImagesConfirmed(event.target.checked)} /> I have permission to use these external image URLs and understand they depend on the source website.</label>}
+            {externalImageCount > 0 && <div className="notice warn" style={{ marginTop: 10 }}><Link2 size={15}/><span>{externalImageCount} image{externalImageCount === 1 ? " is" : "s are"} still hosted outside NEXTVO Storage and may disappear if the source URL changes. Copy permitted supplier images here, or confirm this external source is permitted and that you understand the availability risk.</span></div>}
+            {externalImageCount > 0 && <label className="checkbox" style={{ marginTop: 9 }}><input type="checkbox" checked={externalImagesConfirmed} onChange={(event) => setExternalImagesConfirmed(event.target.checked)} /> I have permission to reuse these images. If supplier-hosted images are copied, the source terms permit copying them into NEXTVO Storage.</label>}
+            {pendingSupplierImages.length > 0 && <button className="button" type="button" style={{ marginTop: 10 }} onClick={() => void copySupplierImagesToStorage()} disabled={saving || copyingSupplierImages || !externalImagesConfirmed}><ImagePlus size={14}/>{copyingSupplierImages ? "Copying supplier images…" : `Copy ${pendingSupplierImages.length} supplier image${pendingSupplierImages.length === 1 ? "" : "s"} into Storage`}</button>}
             {saveOutcomeUncertain && <div className="notice warn" role="status" style={{ marginTop: 10 }}>The previous save has no confirmed result. Uploaded images are being kept; check the product record before retrying or removing a pending image.</div>}
             <div className="photo-strip" style={{ marginTop: 13 }}>
               {photos.map((photo, index) => <div className="photo-tile" key={photo.id}>
@@ -778,14 +1014,66 @@ export default function ProductEditorPage() {
             </div>)}
           </section>
 
-          <section className="card"><div className="section-title"><h2>Specifications</h2><span className="tag">One key: value per line</span></div><textarea className="textarea" value={specifications} onChange={(event) => setSpecifications(event.target.value)} placeholder={'Material: Cotton\nColour: Navy'} /></section>
+          {variationHints.length > 0 && <section className="card">
+            <div className="section-title"><h2>Imported variation hints</h2><span className="status-badge amber">Review only</span></div>
+            <p className="helper">These labels came from source metadata and are not verified NEXTVO variants. Add a group only if it matches the actual product; each variant will still require a manually confirmed stock quantity.</p>
+            {variationHints.map((hint, index) => <div key={`${hint.name}-${index}`} className="stat-line"><span><b>{hint.name}</b><br/><small>{hint.values.join(" · ")}</small></span><button type="button" className="button small ghost" onClick={() => addVariationHintAsVariants(hint)}><Plus size={13}/>Add as variant options</button></div>)}
+          </section>}
+
+          <section className="card">
+            <div className="section-title"><h2>Key features</h2><span className="status-badge">Public catalogue</span></div>
+            <div className="actions"><input className="input" value={featureInput} onChange={(event) => setFeatureInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addFeature(); } }} placeholder="Add a factual, customer-visible feature" /><button type="button" className="button" onClick={addFeature} disabled={!featureInput.trim()}><Plus size={14}/>Add feature</button></div>
+            {keyFeatures.length ? <div className="actions" style={{ marginTop: 12 }}>{keyFeatures.map((feature, index) => <span key={`${feature}-${index}`} className="tag" style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>{feature}<button type="button" aria-label={`Remove feature ${feature}`} onClick={() => setKeyFeatures((current) => current.filter((_, featureIndex) => featureIndex !== index))} style={{ background: "none", border: 0, color: "inherit", cursor: "pointer" }}>×</button></span>)}</div> : <p className="field-note">No features added. Only enter details supported by the product information.</p>}
+          </section>
+
+          <section className="card">
+            <div className="section-title"><h2>Structured specifications</h2><span className="tag">Category-aware · public</span></div>
+            {specificationFields.length ? <div className="form-grid">
+              {specificationFields.map((field) => {
+                const value = specificationValues[field.key] || "";
+                const selectedValues = value.split(",").map((entry) => entry.trim()).filter(Boolean);
+                const unit = specificationUnits[field.key] || field.unit || "";
+                if (field.type === "multi_select") return <div className="field full" key={field.key}>
+                  <label>{field.label}</label>
+                  {field.options?.length ? <div className="actions">{field.options.map((option) => <label className="checkbox" key={option}><input type="checkbox" checked={selectedValues.includes(option)} onChange={(event) => {
+                    const selected = new Set(selectedValues);
+                    if (event.target.checked) selected.add(option); else selected.delete(option);
+                    setSpecificationValues((current) => ({ ...current, [field.key]: Array.from(selected).join(", ") }));
+                  }} />{option}</label>)}</div> : null}
+                  {field.allowCustom || !field.options?.length ? <input className="input" aria-label={`${field.label} values`} value={field.options?.length ? selectedValues.filter((entry) => !field.options?.includes(entry)).join(", ") : value} onChange={(event) => {
+                    if (!field.options?.length) { setSpecificationValues((current) => ({ ...current, [field.key]: event.target.value })); return; }
+                    const predefined = selectedValues.filter((entry) => field.options?.includes(entry));
+                    const custom = event.target.value.split(",").map((entry) => entry.trim()).filter(Boolean);
+                    setSpecificationValues((current) => ({ ...current, [field.key]: [...predefined, ...custom].join(", ") }));
+                  }} placeholder={field.options?.length ? "Other values, separated by commas" : "Values separated by commas"} /> : null}
+                </div>;
+                if (field.type === "boolean") return <div className="field" key={field.key}><label>{field.label}</label><select className="select" value={value} onChange={(event) => setSpecificationValues((current) => ({ ...current, [field.key]: event.target.value }))}><option value="">Not specified</option><option value="true">Yes</option><option value="false">No</option></select></div>;
+                if (field.type === "measurement") return <div className="field" key={field.key}><label>{field.label}</label><div className="actions"><input className="input" type="number" step="any" value={value} onChange={(event) => setSpecificationValues((current) => ({ ...current, [field.key]: event.target.value }))} placeholder="Measurement" />{field.units?.length ? <select className="select" aria-label={`${field.label} unit`} value={unit} onChange={(event) => setSpecificationUnits((current) => ({ ...current, [field.key]: event.target.value }))}><option value="">Unit</option>{unit && !field.units.includes(unit) && <option value={unit}>{unit} (existing)</option>}{field.units.map((candidate) => <option value={candidate} key={candidate}>{candidate}</option>)}</select> : <input className="input" aria-label={`${field.label} unit`} value={unit} onChange={(event) => setSpecificationUnits((current) => ({ ...current, [field.key]: event.target.value }))} placeholder="Unit" />}</div></div>;
+                if (field.type === "select" || field.type === "custom_select") return <div className="field" key={field.key}><label>{field.label}</label><select className="select" value={value} onChange={(event) => setSpecificationValues((current) => ({ ...current, [field.key]: event.target.value }))}><option value="">Choose or leave unspecified</option>{value && !field.options?.includes(value) && <option value={value}>{value} (existing/custom)</option>}{field.options?.map((option) => <option value={option} key={option}>{option}</option>)}</select>{field.allowCustom && <input className="input" value={value && !field.options?.includes(value) ? value : ""} onChange={(event) => setSpecificationValues((current) => ({ ...current, [field.key]: event.target.value }))} placeholder="Or enter a custom value" style={{ marginTop: 7 }} />}</div>;
+                return <div className="field" key={field.key}><label>{field.label}</label><input className="input" type={field.type === "number" ? "number" : "text"} step={field.type === "number" ? "any" : undefined} value={value} onChange={(event) => setSpecificationValues((current) => ({ ...current, [field.key]: event.target.value }))} placeholder={field.unit ? `Value (${field.unit})` : "Optional"} /></div>;
+              })}
+            </div> : <div className="notice warn">Choose a department and subcategory to show the matching specification fields. Existing specifications are kept below as editable custom rows.</div>}
+            <div className="section-title" style={{ marginTop: 18 }}><h3>Custom specifications</h3><button type="button" className="button small" onClick={() => setCustomSpecifications((current) => [...current, { id: crypto.randomUUID(), label: "", value: "" }])}><Plus size={13}/>Add custom field</button></div>
+            {customSpecifications.map((row) => <div key={row.id} className="form-grid" style={{ marginTop: 9 }}>
+              <div className="field"><label>Specification name</label><input className="input" value={row.label} onChange={(event) => setCustomSpecifications((current) => current.map((item) => item.id === row.id ? { ...item, label: event.target.value } : item))} placeholder="e.g. Care instructions" /></div>
+              <div className="field"><label>Value</label><input className="input" value={row.value} onChange={(event) => setCustomSpecifications((current) => current.map((item) => item.id === row.id ? { ...item, value: event.target.value } : item))} placeholder="Accurate product detail" /></div>
+              <div className="field full"><button type="button" className="button danger small" onClick={() => setCustomSpecifications((current) => current.filter((item) => item.id !== row.id))}><Trash2 size={13}/>Remove specification</button></div>
+            </div>)}
+          </section>
         </div>
 
         <aside className="stack">
-          <section className="card"><div className="section-title"><h2>Supplier & internal cost</h2><span className="status-badge amber">Admin-only</span></div><p className="helper">Supplier details are stored in a separate RLS-protected table, not the public product row.</p><div className="stack">
+          <section className="card"><div className="section-title"><h2>Supplier & internal cost</h2><span className="status-badge amber">Admin-only</span></div><p className="helper">Supplier reference data and local sourcing cost are stored in the separate private Admin details table. They are not exposed in the public product row.</p><div className="stack">
             <div className="field"><label>Supplier name</label><input className="input" value={form.supplier_name} onChange={(event) => change("supplier_name", event.target.value)} placeholder="Supplier" /></div>
             <div className="field"><label>Supplier product URL</label><input className="input" type="url" value={form.supplier_url} onChange={(event) => change("supplier_url", event.target.value)} placeholder="https://…" /></div>
-            <div className="form-grid"><div className="field"><label>Supplier cost</label><input className="input" type="number" min="0" step="0.01" value={form.supplier_price} onChange={(event) => change("supplier_price", event.target.value)} placeholder="0.00" /></div><div className="field"><label>Supplier currency</label><input className="input" value={form.supplier_currency} onChange={(event) => change("supplier_currency", event.target.value.toUpperCase())} maxLength={3} placeholder="USD / GBP / EUR / NGN" /></div></div>
+            <div className="form-grid"><div className="field"><label>Supplier reference price</label><input className="input" type="number" min="0" step="0.01" value={form.supplier_price} onChange={(event) => change("supplier_price", event.target.value)} placeholder="Not found" /></div><div className="field"><label>Reference currency</label><input className="input" value={form.supplier_currency} onChange={(event) => change("supplier_currency", event.target.value.toUpperCase())} maxLength={3} placeholder="USD / GBP / EUR / NGN" /></div></div>
+            <div className="field"><label>Local sourcing cost (NGN)</label><input className="input" type="number" min="0" step="0.01" value={form.local_sourcing_cost} onChange={(event) => change("local_sourcing_cost", event.target.value)} placeholder="Optional; enter a confirmed cost" /><span className="field-note">Separate from the supplier reference price, NEXTVO selling price and compare-at price.</span></div>
+            {supplierSourceRecords.length > 0 && <div className="stack"><div className="section-title"><h3>Captured source records</h3><span className="tag">Private</span></div>{supplierSourceRecords.map((source, index) => {
+              const sourceUrl = safeSupplierSourceUrl(source.url);
+              const title = typeof source.title === "string" && source.title.trim() ? source.title : typeof source.supplier_host === "string" ? source.supplier_host : `Source ${index + 1}`;
+              const price = typeof source.price === "string" && source.price ? `${typeof source.currency === "string" ? source.currency : "Currency not identified"} ${source.price}` : "Price not captured";
+              return <div key={`${index}-${sourceUrl || title}`} className="stat-line"><span><b>{title}</b><br/><small>{price}{typeof source.seller === "string" && source.seller ? ` · ${source.seller}` : ""}</small></span>{sourceUrl && <a href={sourceUrl} target="_blank" rel="noreferrer" aria-label={`Open supplier source ${index + 1}`}><ExternalLink size={14}/></a>}</div>;
+            })}<details><summary className="field-note" style={{ cursor: "pointer" }}>Review original captured source JSON</summary><pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", maxHeight: 360, overflow: "auto", fontSize: 11 }}>{JSON.stringify(originalSourceData, null, 2)}</pre></details></div>}
           </div></section>
           <section className="card"><div className="section-title"><h2>Share preview</h2></div><div style={{ display: "grid", gap: 12 }}><div className="product-cell">{photos[0]?.url ? <img className="product-thumb" src={photos[0].url} alt=""/> : <div className="product-thumb empty"><ImagePlus size={18}/></div>}<div><b>{form.name || "Your product name"}</b><div className="tag">{form.price ? formatMoney(form.price, "NGN") : "Selling price (NGN)"}</div></div></div><div className="notice"><Link2 size={15}/><span>{STOREFRONT_URL ? `${STOREFRONT_URL}/products/${slugify(form.slug || form.name) || "product-name"}` : "Set NEXT_PUBLIC_STOREFRONT_URL to generate public links."}</span></div></div></section>
           <div className="actions" style={{ flexDirection: "column", alignItems: "stretch" }}>

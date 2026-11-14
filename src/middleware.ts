@@ -39,7 +39,11 @@ export async function middleware(request: NextRequest) {
   }
   if (requiresAdmin && (!user || !isAuthorizedAdmin(user))) {
     const destination = user ? "/unauthorized" : "/login";
-    return noStore(NextResponse.redirect(new URL(destination, request.url)));
+    const redirectUrl = new URL(destination, request.url);
+    if (!user && pathname === "/products/new" && request.nextUrl.searchParams.get("handoff") === "1") {
+      redirectUrl.searchParams.set("next", "/products/new?handoff=1");
+    }
+    return noStore(NextResponse.redirect(redirectUrl));
   }
   return noStore(response);
 }

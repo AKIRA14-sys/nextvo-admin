@@ -25,7 +25,8 @@ function LoginForm() {
       const { data, error: authError } = await getSupabaseBrowserClient().auth.signInWithPassword({ email: email.trim(), password });
       if (authError || !data.user) throw authError || new Error("Sign-in failed.");
       if (!isAuthorizedAdmin(data.user)) { await getSupabaseBrowserClient().auth.signOut(); throw new Error("This account is authenticated but has not been granted an administrator role. Ask the project owner to authorize it server-side."); }
-      router.replace("/dashboard"); router.refresh();
+      const destination = params.get("next") === "/products/new?handoff=1" ? "/products/new?handoff=1" : "/dashboard";
+      router.replace(destination); router.refresh();
     } catch (e) { setError(e instanceof Error ? e.message : "Sign-in could not be completed."); }
     finally { setBusy(false); }
   }

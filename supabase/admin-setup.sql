@@ -1,6 +1,9 @@
 -- NEXTVO Admin extension for the EXISTING storefront Supabase project.
 -- Review before applying. This never creates a second database or a service-role browser key.
 -- Administrator membership is read only from auth.users.app_metadata, which customers cannot edit.
+-- Existing installations should apply supabase/migrations/20261114125700_nextvo_private_product_source_metadata.sql
+-- before using the updated product editor. This file remains the full setup/bootstrap equivalent;
+-- live schema/RLS compatibility has not been verified for any target project.
 
 begin;
 
@@ -28,6 +31,8 @@ create table if not exists public.nextvo_admin_product_details (
   supplier_product_url text not null default '',
   supplier_price numeric(12,2) check (supplier_price is null or supplier_price >= 0),
   supplier_currency text not null default 'NGN',
+  local_sourcing_cost_ngn numeric(12,2) check (local_sourcing_cost_ngn is null or local_sourcing_cost_ngn >= 0),
+  source_data jsonb not null default '{}'::jsonb check (jsonb_typeof(source_data) = 'object'),
   source_image_urls jsonb not null default '[]'::jsonb check (jsonb_typeof(source_image_urls) = 'array'),
   status text not null default 'draft' check (status in ('draft','published','unpublished','unavailable')),
   updated_by uuid references auth.users(id) on delete set null,
@@ -35,6 +40,10 @@ create table if not exists public.nextvo_admin_product_details (
 );
 alter table public.nextvo_admin_product_details
   add column if not exists source_image_urls jsonb not null default '[]'::jsonb;
+alter table public.nextvo_admin_product_details
+  add column if not exists local_sourcing_cost_ngn numeric(12,2) check (local_sourcing_cost_ngn is null or local_sourcing_cost_ngn >= 0);
+alter table public.nextvo_admin_product_details
+  add column if not exists source_data jsonb not null default '{}'::jsonb check (jsonb_typeof(source_data) = 'object');
 
 create table if not exists public.nextvo_inventory_history (
   id uuid primary key default gen_random_uuid(),
@@ -236,6 +245,8 @@ begin
   if v_category_id is null then raise exception 'Choose a category'; end if;
   if coalesce((p_product ->> 'price_ngn')::numeric, -1) < 0 then raise exception 'Selling price cannot be negative'; end if;
   if v_stock < 0 then raise exception 'Stock cannot be negative'; end if;
+  if nullif(p_private ->> 'local_sourcing_cost_ngn','') is not null and (p_private ->> 'local_sourcing_cost_ngn')::numeric < 0 then raise exception 'Local sourcing cost cannot be negative'; end if;
+  if jsonb_typeof(coalesce(p_private -> 'source_data','{}'::jsonb)) <> 'object' then raise exception 'Original supplier source data must be an object'; end if;
   if jsonb_typeof(coalesce(p_private -> 'source_image_urls','[]'::jsonb)) <> 'array' then raise exception 'Image source metadata must be an array'; end if;
 
   if nullif(p_product ->> 'id','') is null then
@@ -265,9 +276,9 @@ begin
     values(v_id,coalesce(v_old_stock,0),v_stock-coalesce(v_old_stock,0),v_stock,'Stock changed in product editor',auth.uid());
   end if;
 
-  insert into public.nextvo_admin_product_details as current_details(product_id,short_description,supplier_name,supplier_product_url,supplier_price,supplier_currency,source_image_urls,status,updated_by,updated_at)
-  values (v_id,coalesce(p_private ->> 'short_description',''),coalesce(p_private ->> 'supplier_name',''),coalesce(p_private ->> 'supplier_product_url',''),nullif(p_private ->> 'supplier_price','')::numeric,coalesce(nullif(p_private ->> 'supplier_currency',''),'NGN'),coalesce(p_private -> 'source_image_urls','[]'::jsonb),v_status,auth.uid(),now())
-  on conflict(product_id) do update set short_description=excluded.short_description,supplier_name=excluded.supplier_name,supplier_product_url=excluded.supplier_product_url,supplier_price=excluded.supplier_price,supplier_currency=excluded.supplier_currency,source_image_urls=coalesce(p_private -> 'source_image_urls',current_details.source_image_urls),status=excluded.status,updated_by=excluded.updated_by,updated_at=now();
+  insert into public.nextvo_admin_product_details as current_details(product_id,short_description,supplier_name,supplier_product_url,supplier_price,supplier_currency,local_sourcing_cost_ngn,source_data,source_image_urls,status,updated_by,updated_at)
+  values (v_id,coalesce(p_private ->> 'short_description',''),coalesce(p_private ->> 'supplier_name',''),coalesce(p_private ->> 'supplier_product_url',''),nullif(p_private ->> 'supplier_price','')::numeric,coalesce(nullif(p_private ->> 'supplier_currency',''),'NGN'),nullif(p_private ->> 'local_sourcing_cost_ngn','')::numeric,coalesce(p_private -> 'source_data','{}'::jsonb),coalesce(p_private -> 'source_image_urls','[]'::jsonb),v_status,auth.uid(),now())
+  on conflict(product_id) do update set short_description=excluded.short_description,supplier_name=excluded.supplier_name,supplier_product_url=excluded.supplier_product_url,supplier_price=excluded.supplier_price,supplier_currency=excluded.supplier_currency,local_sourcing_cost_ngn=excluded.local_sourcing_cost_ngn,source_data=coalesce(p_private -> 'source_data',current_details.source_data),source_image_urls=coalesce(p_private -> 'source_image_urls',current_details.source_image_urls),status=excluded.status,updated_by=excluded.updated_by,updated_at=now();
 
   delete from public.product_images where product_id = v_id;
   for v_image in select value from jsonb_array_elements(coalesce(p_images,'[]'::jsonb)) loop

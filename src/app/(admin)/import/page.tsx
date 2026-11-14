@@ -1,14 +1,15 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Check, ExternalLink, ImagePlus, Link2, PackagePlus, RefreshCw, Search } from "lucide-react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { STOREFRONT_URL, SUPABASE_CONFIGURED, SUPABASE_URL } from "@/lib/supabase/config";
-import { initialImportedPrices, validateSupplierCost } from "@/lib/product-domain";
 import { safeCopiedImagePreviewUrl } from "@/lib/import-image-preview";
 import { safeError, slugify } from "@/lib/format";
 import { mergeImportHistory, type ImportHistoryItem } from "@/lib/import-history";
+import { createProductHandoff, PRODUCT_HANDOFF_SESSION_KEY, safeHandoffPayloadBytes } from "@/lib/product-handoff";
 
 type Imported = {
   title: string;
@@ -26,37 +27,30 @@ type Imported = {
   supplier_host: string;
   history_id: string | null;
 };
-type Category = { id: string; name: string; active: boolean; subcategories: { id: string; name: string; active: boolean }[] };
 type DuplicateProduct = { id: string; name: string; slug: string; active: boolean };
 
 type ImportForm = {
   name: string;
   description: string;
-  category_id: string;
-  subcategory_id: string;
-  selling: string;
   supplier_price: string;
   currency: string;
-  stock: string;
   sku: string;
 };
 
 const blankForm: ImportForm = {
-  name: "", description: "", category_id: "", subcategory_id: "", selling: "",
-  supplier_price: "", currency: "", stock: "0", sku: "",
+  name: "", description: "", supplier_price: "", currency: "", sku: "",
 };
 
 export default function ImportPage() {
+  const router = useRouter();
   const [url, setUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [item, setItem] = useState<Imported | null>(null);
-  const [categories, setCategories] = useState<Category[]>([]);
   const [selectedImages, setSelectedImages] = useState<string[]>([]);
   const [storedImageUrls, setStoredImageUrls] = useState<Record<string, string>>({});
   const [duplicates, setDuplicates] = useState<DuplicateProduct[]>([]);
-  const [saving, setSaving] = useState(false);
   const [copyingImages, setCopyingImages] = useState(false);
   const [copyProgress, setCopyProgress] = useState({ complete: 0, total: 0 });
   const [imageRightsConfirmed, setImageRightsConfirmed] = useState(false);
@@ -67,7 +61,6 @@ export default function ImportPage() {
   const [historyError, setHistoryError] = useState("");
   const [historyWriteWarning, setHistoryWriteWarning] = useState("");
   const retrieveLock = useRef(false);
-  const saveLock = useRef(false);
   const copyLock = useRef(false);
   const historySequence = useRef(0);
   const historyMutationVersion = useRef(0);
@@ -82,15 +75,6 @@ export default function ImportPage() {
       return host;
     } catch { return "supplier"; }
   })();
-
-  useEffect(() => {
-    if (!SUPABASE_CONFIGURED) return;
-    void getSupabaseBrowserClient().from("categories").select("id,name,active,subcategories(id,name,active)").eq("active", true).order("display_order")
-      .then(({ data, error: categoryError }: { data: Category[] | null; error: { message: string } | null }) => {
-        if (categoryError) setError(`Could not read departments: ${safeError(categoryError)}`);
-        else setCategories((data || []) as Category[]);
-      });
-  }, []);
 
   function setField<K extends keyof ImportForm>(key: K, value: ImportForm[K]) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -153,7 +137,7 @@ export default function ImportPage() {
 
   async function retrieve(event?: FormEvent) {
     event?.preventDefault();
-    if (retrieveLock.current || saving || copyingImages) return;
+    if (retrieveLock.current || copyingImages) return;
     retrieveLock.current = true;
     const controller = new AbortController();
     activeRequest.current = controller;
@@ -179,25 +163,20 @@ export default function ImportPage() {
       setHistoryWriteWarning(data.history_warning || "");
       if (!response.ok) throw new Error(`${data.error || "Could not retrieve this product."}${data.request_id ? ` Reference: ${data.request_id}.` : ""}`);
       const imported = data as Imported;
-      const prices = initialImportedPrices(imported.price || "", imported.currency || "");
       setItem(imported);
       setSelectedImages(imported.images.slice(0, Math.min(4, imported.images.length)));
       setForm({
         name: imported.title,
         description: imported.description,
-        category_id: "",
-        subcategory_id: "",
-        selling: prices.sellingPriceNgn,
-        supplier_price: prices.supplierPrice,
-        currency: prices.supplierCurrency,
-        stock: "0",
+        supplier_price: imported.price || "",
+        currency: imported.currency || "",
         sku: imported.sku,
       });
       const { data: dupes, error: duplicateError } = await getSupabaseBrowserClient()
         .from("products").select("id,name,slug,active").ilike("name", imported.title).limit(6);
       if (duplicateError) setNotice("Metadata was retrieved, but duplicate lookup failed. Check the catalogue manually before saving.");
       else if (dupes?.length) setDuplicates(dupes as DuplicateProduct[]);
-      if (!duplicateError) setNotice(data.extraction_warning || "Public page metadata retrieved. The source price is kept as supplier cost; enter a separate NGN selling price before saving.");
+      if (!duplicateError) setNotice(data.extraction_warning || "Public page metadata retrieved. Review it, then continue to the unified product editor to enter NGN selling price and verified stock.");
     } catch (caught) {
       if (mounted.current) setError(controller.signal.aborted ? "Retrieval timed out or was cancelled. Your URL is preserved; you can retry." : safeError(caught));
     } finally {
@@ -211,15 +190,13 @@ export default function ImportPage() {
     }
   }
 
-  const subcategories = categories.find((category) => category.id === form.category_id)?.subcategories.filter((sub) => sub.active) || [];
-
   function toggleImage(image: string) {
     setSelectedImages((current) => current.includes(image) ? current.filter((value) => value !== image) : [...current, image]);
     setReviewConfirmed(false);
   }
 
   async function copyImagesToStorage() {
-    if (!item || !selectedImages.length || copyLock.current || saveLock.current || retrieveLock.current) return;
+    if (!item || !selectedImages.length || copyLock.current || retrieveLock.current) return;
     if (!imageRightsConfirmed) {
       setError("Confirm that you have permission to reuse each selected image and that the source terms allow copying.");
       return;
@@ -256,119 +233,74 @@ export default function ImportPage() {
     else setNotice(`Copied ${pending.length} image${pending.length === 1 ? "" : "s"} into the existing Supabase Storage bucket. The original source links remain visible during review.`);
   }
 
-  async function save(state: "draft" | "published", event?: FormEvent) {
-    event?.preventDefault();
-    if (saveLock.current || copyLock.current || retrieveLock.current) return;
+  function continueToEditor() {
+    if (copyLock.current || retrieveLock.current) return;
     setError("");
     setNotice("");
     if (!item) return;
     if (!reviewConfirmed) {
-      setError("Confirm that you reviewed the extracted details, the separate NGN selling price and image usage before saving.");
+      setError("Confirm that you reviewed the extracted supplier metadata and any selected image rights before continuing.");
       return;
     }
-    if (!form.category_id) {
-      setError("Choose a department before saving.");
+    if (selectedImages.some((image) => !storedImageUrls[image])) {
+      setError("Copy every selected image into NEXTVO Storage or deselect it before continuing. External supplier image URLs will not be sent to the product editor.");
       return;
     }
-    const sellingPrice = Number(form.selling);
-    const stock = Number(form.stock);
-    if (!form.name.trim() || !form.selling.trim() || !Number.isFinite(sellingPrice) || sellingPrice < 0) {
-      setError("Enter a product name and a separately reviewed NEXTVO selling price in NGN.");
+    const storageImages = selectedImages.map((sourceUrl) => storedImageUrls[sourceUrl]);
+    const source = {
+      url: item.source_url,
+      supplier_host: item.supplier_host,
+      captured_at: new Date().toISOString(),
+      history_id: item.history_id,
+      title: item.title || null,
+      brand: item.brand || null,
+      price: item.price || null,
+      currency: item.currency || null,
+      original_price: null,
+      description: item.description || null,
+      images: item.images,
+      features: [],
+      specifications: item.attributes || {},
+      variations: item.variants?.length ? [{ name: "Unverified source variation labels", values: item.variants }] : [],
+      sku: item.sku || null,
+      availability: null,
+      category: null,
+      seller: item.supplier_name || null,
+    };
+    const draft = createProductHandoff([source], {
+      title: form.name.trim(),
+      brand: item.brand || null,
+      description: form.description.trim(),
+      supplier_reference_price: form.supplier_price.trim() || null,
+      supplier_reference_currency: form.currency.trim().toUpperCase() || null,
+      sku: form.sku.trim() || null,
+      images: storageImages,
+      image_sources: Object.fromEntries(selectedImages.map((sourceUrl) => [storedImageUrls[sourceUrl], sourceUrl])),
+      features: [],
+      specifications: item.attributes || {},
+      variations: source.variations,
+    });
+    if (!draft) {
+      setError("Could not create a valid, expiring product draft. Check the source URL and try again.");
       return;
     }
-    if (!Number.isInteger(stock) || stock < 0) {
-      setError("Stock must be a non-negative whole number; verify it manually.");
+    const serialized = JSON.stringify(draft);
+    if (!safeHandoffPayloadBytes(serialized)) {
+      setError("The reviewed draft is too large to hand off safely. Remove some selected images and try again.");
       return;
     }
-    let supplierCost: ReturnType<typeof validateSupplierCost>;
-    try { supplierCost = validateSupplierCost(form.supplier_price, form.currency); }
-    catch (caught) { setError(safeError(caught)); return; }
-    const unownedImages = selectedImages.filter((image) => !storedImageUrls[image]);
-    if (unownedImages.length) {
-      setError("Copy permitted images into Supabase Storage or deselect them. External supplier-hosted images are not saved by this importer.");
-      return;
-    }
-
-    saveLock.current = true;
-    setSaving(true);
-    const db = getSupabaseBrowserClient();
     try {
-      const photos = selectedImages.map((sourceUrl, sort_order) => ({
-        image_url: storedImageUrls[sourceUrl],
-        alt_text: form.name,
-        sort_order,
-      }));
-      const attributes = { ...(item.attributes || {}), ...(item.brand ? { Brand: item.brand } : {}), ...(item.model ? { Model: item.model } : {}), ...(form.sku ? { SKU: form.sku } : {}) };
-      const slug = slugify(form.name);
-      if (!slug) throw new Error("Enter a product name that produces a valid product URL slug.");
-      const { data: duplicate, error: duplicateError } = await db.from("products").select("id,name").eq("slug", slug).maybeSingle();
-      if (duplicateError) throw new Error("Could not verify the product URL slug; no product was saved.");
-      if (duplicate) throw new Error(`The product URL slug is already used by “${duplicate.name}”. Change the product name before saving.`);
-      const product = {
-        slug,
-        name: form.name.trim(),
-        description: form.description.trim(),
-        brand: item.brand || null,
-        price_ngn: sellingPrice,
-        compare_at_price_ngn: null,
-        currency_code: "NGN",
-        category_id: form.category_id,
-        subcategory_id: form.subcategory_id || null,
-        image_url: photos[0]?.image_url || null,
-        stock_quantity: stock,
-        featured: false,
-        is_new_arrival: false,
-        active: state === "published",
-        attributes,
-        search_terms: form.name.toLowerCase().split(/\s+/).filter(Boolean),
-      };
-      const privateData = {
-        short_description: "",
-        supplier_name: item.supplier_name || item.supplier_host,
-        supplier_product_url: item.source_url,
-        supplier_price: supplierCost.supplierPrice,
-        supplier_currency: supplierCost.supplierCurrency || "NGN",
-        source_image_urls: selectedImages.filter((sourceUrl) => storedImageUrls[sourceUrl]).map((sourceUrl) => ({ image_url: storedImageUrls[sourceUrl], source_url: sourceUrl })),
-        status: state,
-      };
-      const { data, error: saveError } = await db.rpc("nextvo_admin_save_product", {
-        p_product: product,
-        p_private: privateData,
-        p_images: photos,
-        p_variants: [],
-      });
-      if (saveError) {
-        if (saveError.code === "23505") throw new Error("That product URL slug is already in use. Change the product name before saving.");
-        throw saveError;
-      }
-      if (!data) throw new Error("No product ID returned.");
-
-      let historyWarning = "";
-      if (item.history_id) {
-        const { data: updatedHistory, error: historyUpdateError } = await db.from("nextvo_import_history").update({ status: "saved" }).eq("id", item.history_id)
-          .select("id,source_url,supplier_host,status,imported_title,error_summary,created_at").single();
-        if (historyUpdateError || !updatedHistory) historyWarning = " Product saved, but its history status could not be confirmed updated. Refresh history or check Admin history permissions.";
-        else acceptConfirmedHistory(updatedHistory as ImportHistoryItem);
-      }
-      setNotice(`${state === "published" ? "Product saved and published" : "Product saved as a draft"} in the shared catalogue.${historyWarning}`);
-      setItem(null);
-      setUrl("");
-      setForm(blankForm);
-      setSelectedImages([]);
-      setStoredImageUrls({});
-      setReviewConfirmed(false);
-      await refreshHistory();
-    } catch (caught) {
-      setError(`Product was not confirmed saved: ${safeError(caught)}`);
-    } finally {
-      saveLock.current = false;
-      setSaving(false);
+      window.sessionStorage.setItem(PRODUCT_HANDOFF_SESSION_KEY, serialized);
+      setNotice("Reviewed draft is ready. The unified product editor will ask you to add the public NGN selling price and confirm NEXTVO stock.");
+      router.push("/products/new?handoff=1");
+    } catch {
+      setError("This browser could not securely keep the short-lived draft. Enable session storage or use the PWA share action again.");
     }
   }
 
   return <>
     <div className="page-heading">
-      <div><div className="eyebrow">SUPPLIER METADATA REVIEW</div><h1>Import product</h1><p>Retrieve permitted public metadata, review each field, then save a draft or explicitly publish.</p></div>
+      <div><div className="eyebrow">SUPPLIER METADATA REVIEW</div><h1>Import product</h1><p>Review permitted public metadata, then continue to the single product editor for all catalogue changes.</p></div>
       <Link href="/products/new" className="button ghost"><PackagePlus size={15}/>Manual entry</Link>
     </div>
     {notice && <div className="notice success" role="status" style={{ marginBottom: 14 }}><Check size={17}/>{notice}</div>}
@@ -380,8 +312,8 @@ export default function ImportPage() {
           <div className="section-title"><h2>Supplier product URL</h2><Link2 size={17} color="#79a5ff"/></div>
           <p className="helper">We check public HTTPS pages for structured product data and Open Graph metadata. Extraction varies by source. CAPTCHA, sign-in, paywalls, anti-bot controls and other source restrictions are not bypassed; manual entry remains available.</p>
           <form onSubmit={retrieve} className="stack" style={{ marginTop: 15 }}>
-            <div className="field"><label htmlFor="supplier-page-url">Public product page</label><input id="supplier-page-url" className="input" required type="url" value={url} disabled={busy || saving || copyingImages} onChange={(event) => setUrl(event.target.value)} placeholder="https://supplier.example/product/…" /></div>
-            <button className="button primary" disabled={busy || saving || copyingImages || !url}><Search size={15}/>{busy ? `Retrieving ${supplierLabel} metadata…` : "Retrieve product"}</button>
+            <div className="field"><label htmlFor="supplier-page-url">Public product page</label><input id="supplier-page-url" className="input" required type="url" value={url} disabled={busy || copyingImages} onChange={(event) => setUrl(event.target.value)} placeholder="https://supplier.example/product/…" /></div>
+            <button className="button primary" disabled={busy || copyingImages || !url}><Search size={15}/>{busy ? `Retrieving ${supplierLabel} metadata…` : "Retrieve product"}</button>
           </form>
           {busy && <p className="helper" role="status" aria-live="polite">Checking {supplierLabel} public page and safe redirects. Your result will be recorded before history refreshes.</p>}
           <div className="notice warn" style={{ marginTop: 15 }}><AlertTriangle size={15}/><span>Extracted values are unverified. Shipping, variants, stock and supplier options are not reliably extracted. Confirm all text, source prices and image rights.</span></div>
@@ -412,22 +344,20 @@ export default function ImportPage() {
           </div>}
           {!item.images.length && <div className="empty-state"><div className="empty-icon"><ImagePlus size={18}/></div><p>No image candidates were found. Add your own permitted photos from the product editor after saving.</p></div>}
 
-          <form className="stack" onSubmit={(event) => save("draft", event)}>
+          <div className="stack">
             <div className="form-grid">
               <div className="field full"><label htmlFor="import-name">Product title</label><input id="import-name" className="input" required value={form.name} onChange={(event) => setField("name", event.target.value)} /></div>
               <div className="field full"><label htmlFor="import-description">Description</label><textarea id="import-description" className="textarea" value={form.description} onChange={(event) => setField("description", event.target.value)} /></div>
-              <div className="field"><label htmlFor="import-category">Department</label><select id="import-category" className="select" value={form.category_id} onChange={(event) => { setField("category_id", event.target.value); setField("subcategory_id", ""); }}><option value="">Choose department</option>{categories.map((category) => <option value={category.id} key={category.id}>{category.name}</option>)}</select></div>
-              <div className="field"><label htmlFor="import-subcategory">Subcategory</label><select id="import-subcategory" className="select" value={form.subcategory_id} onChange={(event) => setField("subcategory_id", event.target.value)}><option value="">None</option>{subcategories.map((subcategory) => <option value={subcategory.id} key={subcategory.id}>{subcategory.name}</option>)}</select></div>
-              <div className="field"><label htmlFor="import-selling-price">NEXTVO selling price (NGN) *</label><input id="import-selling-price" className="input" type="number" min="0" step="0.01" required value={form.selling} onChange={(event) => setField("selling", event.target.value)} /><span className="field-note">Blank by default; manually enter and confirm the public NGN price. No foreign amount is converted.</span></div>
-              <div className="field"><label htmlFor="import-supplier-cost">Supplier cost (private)</label><input id="import-supplier-cost" className="input" type="number" min="0" step="0.01" value={form.supplier_price} onChange={(event) => setField("supplier_price", event.target.value)} /></div>
-              <div className="field"><label htmlFor="import-supplier-currency">Supplier cost currency</label><input id="import-supplier-currency" className="input" value={form.currency} onChange={(event) => setField("currency", event.target.value.toUpperCase())} placeholder="USD / GBP / EUR / NGN" maxLength={3} /><span className="field-note">Original 3-letter currency code; no exchange rate or conversion is applied.</span></div>
-              <div className="field"><label htmlFor="import-stock">Stock (verify manually)</label><input id="import-stock" className="input" type="number" min="0" step="1" value={form.stock} onChange={(event) => setField("stock", event.target.value)} /><span className="field-note">Source inventory is not treated as verified stock.</span></div>
-              <div className="field"><label htmlFor="import-sku">SKU (if available)</label><input id="import-sku" className="input" value={form.sku} onChange={(event) => setField("sku", event.target.value)} /></div>
-              <div className="field"><label>Original source price</label><div className="input" style={{ display: "flex", alignItems: "center" }}>{item.price ? `${item.currency || "Currency not identified"} ${item.price}` : "Not found"}</div><span className="field-note">Kept separate from NEXTVO&apos;s NGN selling price.</span></div>
+              <div className="field"><label htmlFor="import-reference-price">Supplier reference price</label><input id="import-reference-price" className="input" type="number" min="0" step="0.01" value={form.supplier_price} onChange={(event) => setField("supplier_price", event.target.value)} placeholder="Not found" /></div>
+              <div className="field"><label htmlFor="import-reference-currency">Reference currency</label><input id="import-reference-currency" className="input" value={form.currency} onChange={(event) => setField("currency", event.target.value.toUpperCase())} placeholder="USD / GBP / EUR / NGN" maxLength={12} /><span className="field-note">No currency conversion is applied; this remains private supplier reference data.</span></div>
+              <div className="field"><label htmlFor="import-sku">Source SKU hint</label><input id="import-sku" className="input" value={form.sku} onChange={(event) => setField("sku", event.target.value)} placeholder="Review before using" /></div>
+              <div className="field"><label>Original extracted price</label><div className="input" style={{ display: "flex", alignItems: "center" }}>{item.price ? `${item.currency || "Currency not identified"} ${item.price}` : "Not found"}</div><span className="field-note">Kept as source context separately from the editable reference amount.</span></div>
             </div>
-            <label className="checkbox"><input type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.target.checked)} /> I reviewed the extracted fields, entered the intended NGN selling price, and confirmed that product copy and selected images may be used.</label>
-            <div className="actions"><button type="submit" className="button" disabled={saving || copyingImages || !SUPABASE_CONFIGURED || !reviewConfirmed}>{saving ? "Saving…" : "Save draft"}</button><button type="button" className="button primary" disabled={saving || copyingImages || !SUPABASE_CONFIGURED || !reviewConfirmed} onClick={() => void save("published")}>{saving ? "Saving…" : "Publish reviewed product"}</button></div>
-          </form>
+            {item.variants && item.variants.length > 0 && <div className="notice warn"><AlertTriangle size={15}/><span>Source variation labels are unverified hints. The product editor will let you review them; no variant stock or selling prices are assumed.</span></div>}
+            <label className="checkbox"><input type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.target.checked)} /> I reviewed the extracted supplier details and confirmed rights for every selected image.</label>
+            <p className="field-note">No product record is saved here. NEXTVO selling price, local sourcing cost, category, and verified stock are handled in the unified product editor.</p>
+            <div className="actions"><button type="button" className="button primary" disabled={copyingImages || !SUPABASE_CONFIGURED || !reviewConfirmed || selectedImages.some((image) => !storedImageUrls[image])} onClick={continueToEditor}><PackagePlus size={15}/>Continue to product editor</button></div>
+          </div>
         </section>}
 
         <section className="card">
@@ -443,9 +373,9 @@ export default function ImportPage() {
         <div className="stack">
           <div className="stat-line"><span>Extraction</span><b>Public metadata only</b></div>
           <div className="stat-line"><span>Supplier price</span><b>Separate currency</b></div>
-          <div className="stat-line"><span>NGN selling price</span><b>Entered by admin</b></div>
+          <div className="stat-line"><span>Product management</span><b>One unified editor</b></div>
           <div className="stat-line"><span>Images</span><b>Copy with rights or upload manually</b></div>
-          <div className="stat-line"><span>Stock / variants / shipping</span><b>Verify manually</b></div>
+          <div className="stat-line"><span>Stock / variants</span><b>Review and confirm in editor</b></div>
           <div className="notice" style={{ marginTop: 7 }}><Link2 size={15}/><div>Public link uses the configured storefront domain:<br/>{STOREFRONT_URL || "NEXT_PUBLIC_STOREFRONT_URL not set"}/products/{slugify(form.name) || "product-slug"}</div></div>
           <Link className="button ghost" href="/products/new">Enter or finish editing manually</Link>
         </div>
