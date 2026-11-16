@@ -211,3 +211,20 @@ test("safe contain framing keeps the entire portrait photograph in the 4:3 card"
     browser.restore();
   }
 });
+
+test("a manually selected background is drawn behind the intact photo in the 4:3 card", async () => {
+  const browser = mockImageBrowser(800, 1200);
+  const source = sourceFile("transparent-cutout.png", "image/png");
+  const background = sourceFile("shop-background.jpg", "image/jpeg");
+  try {
+    const prepared = await prepareProductImages(source, { x: 0.5, y: 0.5, zoom: 1, mode: "contain" }, background);
+    assert.deepEqual(new Uint8Array(await prepared.original.arrayBuffer()), new Uint8Array(await source.arrayBuffer()));
+    assert.equal(prepared.card.type, "image/jpeg");
+    assert.deepEqual([browser.draws[0].width, browser.draws[0].height], [1600, 1200]);
+    assert.deepEqual([browser.draws[1].width, browser.draws[1].height], [1600, 1200]);
+    assert.equal(browser.draws.length, 2);
+    assert.ok(browser.bitmapClosed);
+  } finally {
+    browser.restore();
+  }
+});

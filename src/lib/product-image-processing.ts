@@ -233,15 +233,24 @@ function renderCardFrame(
   sourceMime: string,
   crop: ProductCropOptions,
   preserveAlpha: boolean,
+  backgroundBitmap?: ImageBitmap,
+  backgroundHasTransparency = false,
 ): Promise<File> {
   const region = getProductCardSourceRegion(bitmap.width, bitmap.height, crop);
-  const preferredMime = preferredOutputMime(sourceMime, preserveAlpha);
+  const outputPreserveAlpha = backgroundBitmap ? preserveAlpha && backgroundHasTransparency : preserveAlpha;
+  const preferredMime = preferredOutputMime(sourceMime, outputPreserveAlpha);
   const stem = file.name.replace(/\.[^.]*$/, "").trim() || "product-image";
 
   return encodeCanvasBelowLimit(
     (context, targetWidth, targetHeight) => {
+      if (backgroundBitmap) {
+        const scale = Math.max(targetWidth / backgroundBitmap.width, targetHeight / backgroundBitmap.height);
+        const width = backgroundBitmap.width * scale;
+        const height = backgroundBitmap.height * scale;
+        context.drawImage(backgroundBitmap, (targetWidth - width) / 2, (targetHeight - height) / 2, width, height);
+      }
       if (region.mode === "contain") {
-        drawContainComposition(context, bitmap, targetWidth, targetHeight, preserveAlpha);
+        drawContainComposition(context, bitmap, targetWidth, targetHeight, preserveAlpha || Boolean(backgroundBitmap));
       } else {
         context.drawImage(
           bitmap,
@@ -259,7 +268,7 @@ function renderCardFrame(
     PRODUCT_CARD_WIDTH,
     PRODUCT_CARD_HEIGHT,
     preferredMime,
-    preserveAlpha,
+    outputPreserveAlpha,
     `${stem}${PRODUCT_CARD_IMAGE_SUFFIX}`,
     file.lastModified,
     true,
@@ -289,6 +298,7 @@ function bitmapHasTransparency(bitmap: ImageBitmap, sourceMime: string): boolean
 export async function prepareProductImages(
   file: File,
   crop: ProductCropOptions = { x: 0.5, y: 0.5, zoom: 1, mode: "crop" },
+  backgroundFile?: File,
 ): Promise<PreparedProductImages> {
   if (!file.size) throw new Error("The selected image is empty.");
   if (file.size > MAX_PRODUCT_IMAGE_SOURCE_BYTES) {
@@ -299,16 +309,28 @@ export async function prepareProductImages(
   const actualMime = stableFile.type;
 
   const bitmap = await decodeOrientedImage(stableFile);
+  let backgroundBitmap: ImageBitmap | undefined;
   try {
     if (!bitmap.width || !bitmap.height) throw new Error("The selected image has invalid dimensions.");
+    let backgroundHasTransparency = false;
+    if (backgroundFile) {
+      if (backgroundFile.size > MAX_PRODUCT_IMAGE_SOURCE_BYTES) {
+        throw new Error("This background image is too large to process on this device (maximum source size: 30 MB).");
+      }
+      const stableBackground = await createStableProductImage(backgroundFile);
+      backgroundBitmap = await decodeOrientedImage(stableBackground);
+      if (!backgroundBitmap.width || !backgroundBitmap.height) throw new Error("The selected background image has invalid dimensions.");
+      backgroundHasTransparency = bitmapHasTransparency(backgroundBitmap, stableBackground.type);
+    }
     const preserveAlpha = bitmapHasTransparency(bitmap, actualMime);
     const original = stableFile.size <= MAX_PRODUCT_IMAGE_BYTES
       ? new File([stableFile], withImageExtension(stableFile.name, imageExtension(actualMime)), { type: actualMime, lastModified: stableFile.lastModified })
       : await renderFullFrame(bitmap, stableFile, actualMime, preserveAlpha);
-    const card = await renderCardFrame(bitmap, stableFile, actualMime, crop, preserveAlpha);
+    const card = await renderCardFrame(bitmap, stableFile, actualMime, crop, preserveAlpha, backgroundBitmap, backgroundHasTransparency);
     return { original, card, width: bitmap.width, height: bitmap.height };
   } finally {
     bitmap.close();
+    backgroundBitmap?.close();
   }
 }
 
