@@ -13,7 +13,9 @@ import { describeImageUploadError, getProductCardSourceRegion, isProductCardImag
 import { formatMoney, safeError, slugify } from "@/lib/format";
 import { normalizeFeatures, templateForSubcategory } from "@/lib/product-specifications";
 import { buildPublicProductAttributes, buildSpecificationAttributes, readSpecificationDraft, type CustomSpecificationDraft } from "@/lib/product-editor-data";
+import { MAX_PRODUCT_BACKGROUND_OPTIONS, readStoredProductBackgrounds, type ProductBackgroundOption, type StoredProductBackground } from "@/lib/product-backgrounds";
 import { PRODUCT_HANDOFF_SESSION_KEY, validateProductHandoffPayload, type HandoffVariation, type ProductHandoff } from "@/lib/product-handoff";
+import { ProductBackgroundEditor } from "@/components/ProductBackgroundEditor";
 
 const NEW = "new";
 const PRIVATE_METADATA_MIGRATION = "supabase/migrations/20261114125700_nextvo_private_product_source_metadata.sql";
@@ -29,6 +31,7 @@ type Photo = {
   uploadedUrl?: string;
   cardUploadPath?: string;
   cardUploadedUrl?: string;
+  cardBackgroundId?: string;
   cropX?: number;
   cropY?: number;
   cropZoom?: number;
@@ -41,6 +44,8 @@ type Photo = {
   imageWidth?: number;
   imageHeight?: number;
   imageHasTransparency?: boolean;
+  backgroundOptions?: ProductBackgroundOption[];
+  selectedBackgroundId?: string;
   uploadStatus?: "uploading" | "uploaded" | "failed";
   uploadError?: string;
 };
@@ -87,7 +92,12 @@ function isManagedStorageUrl(value: string) {
   }
 }
 
-type ImageMetadata = { sourceUrl?: string; cardUrl?: string };
+type ImageMetadata = {
+  sourceUrl?: string;
+  cardUrl?: string;
+  backgrounds?: StoredProductBackground[];
+  selectedBackgroundUrl?: string;
+};
 
 function readImageSources(value: unknown): Map<string, ImageMetadata> {
   const sources = new Map<string, ImageMetadata>();
@@ -108,7 +118,10 @@ function readImageSources(value: unknown): Map<string, ImageMetadata> {
         const card = new URL(entry.card_image_url);
         if (card.protocol === "https:" && !card.username && !card.password) metadata.cardUrl = card.toString();
       }
-      if (metadata.sourceUrl || metadata.cardUrl) sources.set(image.toString(), metadata);
+      const storedBackgrounds = readStoredProductBackgrounds(entry.background_options, entry.selected_background_url);
+      if (storedBackgrounds.backgrounds.length) metadata.backgrounds = storedBackgrounds.backgrounds;
+      if (storedBackgrounds.selectedBackgroundUrl) metadata.selectedBackgroundUrl = storedBackgrounds.selectedBackgroundUrl;
+      if (metadata.sourceUrl || metadata.cardUrl || metadata.backgrounds?.length) sources.set(image.toString(), metadata);
     } catch { /* malformed private source metadata is ignored */ }
   }
   return sources;
@@ -138,6 +151,18 @@ function safeSupplierSourceUrl(value: unknown): string | null {
   } catch { return null; }
 }
 
+async function readPublicImageFile(urlValue: string, fileName: string): Promise<File> {
+  const url = new URL(urlValue);
+  if (url.protocol !== "https:" || url.username || url.password) throw new Error("The image URL must be public HTTPS without embedded credentials.");
+  const response = await fetch(url.toString(), { mode: "cors", credentials: "omit" });
+  if (!response.ok) throw new Error(`Could not read the existing image (HTTP ${response.status}). Re-add the product photo from your phone and retry.`);
+  const blob = await response.blob();
+  if (blob.size > MAX_PRODUCT_IMAGE_SOURCE_BYTES) throw new Error("The existing image is larger than 30 MB. Re-add a smaller copy from your phone.");
+  const type = (blob.type || response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  if (!type.startsWith("image/")) throw new Error("The existing image response was not an image. Re-add the product photo from your phone.");
+  return new File([blob], fileName, { type, lastModified: Date.now() });
+}
+
 export default function ProductEditorPage() {
   const params = useParams<{ id: string }>();
   const id = params.id;
@@ -155,6 +180,7 @@ export default function ProductEditorPage() {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [fileInputKey, setFileInputKey] = useState(0);
   const [cropPhotoId, setCropPhotoId] = useState<string | null>(null);
+  const [backgroundEditorPhotoId, setBackgroundEditorPhotoId] = useState<string | null>(null);
   const [specificationValues, setSpecificationValues] = useState<Record<string, string>>({});
   const [specificationUnits, setSpecificationUnits] = useState<Record<string, string>>({});
   const [customSpecifications, setCustomSpecifications] = useState<CustomSpecificationDraft[]>([]);
@@ -185,6 +211,9 @@ export default function ProductEditorPage() {
   useEffect(() => () => {
     for (const photo of photosRef.current) {
       if (photo.url.startsWith("blob:")) URL.revokeObjectURL(photo.url);
+      for (const background of photo.backgroundOptions || []) {
+        if (background.url.startsWith("blob:")) URL.revokeObjectURL(background.url);
+      }
     }
   }, []);
 
@@ -224,6 +253,7 @@ export default function ProductEditorPage() {
   const externalImageCount = photos.filter((photo) => !isManagedStorageUrl(photo.url) && !photo.file).length;
   const pendingSupplierImages = photos.filter((photo) => photo.sourceUrl && !isManagedStorageUrl(photo.url) && !photo.file);
   const cropPhoto = photos.find((photo) => photo.id === cropPhotoId && photo.file);
+  const backgroundEditorPhoto = photos.find((photo) => photo.id === backgroundEditorPhotoId);
   const cropOptions: ProductCropOptions | null = cropPhoto ? {
     x: cropPhoto.cropX ?? 0.5,
     y: cropPhoto.cropY ?? 0.5,
@@ -338,7 +368,13 @@ export default function ProductEditorPage() {
         .filter((image) => !isProductCardImageUrl(image.image_url))
         .map((image) => {
         const metadata = imageSources.get(image.image_url);
-        return { id: crypto.randomUUID(), url: image.image_url, sourceUrl: metadata?.sourceUrl, cardUrl: metadata?.cardUrl, alt: image.alt_text || product.name };
+        const backgroundOptions = (metadata?.backgrounds || []).map((background) => ({
+          id: crypto.randomUUID(),
+          url: background.image_url,
+          cardUrl: background.card_image_url,
+        }));
+        const selectedBackgroundId = backgroundOptions.find((background) => background.url === metadata?.selectedBackgroundUrl)?.id;
+        return { id: crypto.randomUUID(), url: image.image_url, sourceUrl: metadata?.sourceUrl, cardUrl: metadata?.cardUrl, alt: image.alt_text || product.name, backgroundOptions, selectedBackgroundId, cardBackgroundId: selectedBackgroundId };
       });
       if (product.image_url && isProductCardImageUrl(product.image_url)) {
         if (imageRows[0]) imageRows[0].cardUrl = product.image_url;
@@ -539,14 +575,78 @@ export default function ProductEditorPage() {
     });
   }
 
+  async function addBackground(photoId: string, file: File) {
+    const photo = photos.find((item) => item.id === photoId);
+    if (!photo || saving || processingImages) return;
+    if ((photo.backgroundOptions || []).length >= MAX_PRODUCT_BACKGROUND_OPTIONS) {
+      setError(`Each product image can have up to ${MAX_PRODUCT_BACKGROUND_OPTIONS} background choices.`);
+      return;
+    }
+    setProcessingImages(true);
+    setError("");
+    try {
+      const prepared = await prepareProductImages(file, { x: 0.5, y: 0.5, zoom: 1, mode: "crop" });
+      const background: ProductBackgroundOption = {
+        id: crypto.randomUUID(),
+        url: URL.createObjectURL(prepared.original),
+        file: prepared.original,
+        cardFile: prepared.card,
+      };
+      setPhotos((current) => current.map((item) => item.id === photoId
+        ? { ...item, backgroundOptions: [...(item.backgroundOptions || []), background] }
+        : item));
+    } catch (caught) {
+      setError(`Background “${file.name}” could not be prepared. ${safeError(caught)}`);
+    } finally {
+      setProcessingImages(false);
+    }
+  }
+
+  function selectBackground(photoId: string, backgroundId?: string) {
+    if (saving) return;
+    setPhotos((current) => current.map((photo) => photo.id === photoId
+      ? { ...photo, selectedBackgroundId: backgroundId }
+      : photo));
+    setError("");
+  }
+
+  async function removeBackground(photoId: string, backgroundId: string) {
+    const photo = photos.find((item) => item.id === photoId);
+    const background = photo?.backgroundOptions?.find((item) => item.id === backgroundId);
+    if (!photo || !background || saving) return;
+    const uploadedPaths = [background.uploadPath, background.cardUploadPath].filter((path): path is string => Boolean(path));
+    if (saveOutcomeUncertain && uploadedPaths.length) {
+      setError("This background upload may already be referenced by a save without a confirmed response. Check the product record or retry the save before removing it.");
+      return;
+    }
+    if (uploadedPaths.length) {
+      const { error: removeError } = await getSupabaseBrowserClient().storage.from("product-images").remove(uploadedPaths);
+      if (removeError) {
+        setError(`Could not remove the temporary background. ${describeImageUploadError(removeError)}`);
+        return;
+      }
+      for (const path of uploadedPaths) uploadedPathsRef.current.delete(path);
+    }
+    if (background.url.startsWith("blob:")) URL.revokeObjectURL(background.url);
+    setPhotos((current) => current.map((item) => item.id === photoId
+      ? {
+        ...item,
+        backgroundOptions: (item.backgroundOptions || []).filter((option) => option.id !== backgroundId),
+        selectedBackgroundId: item.selectedBackgroundId === backgroundId ? undefined : item.selectedBackgroundId,
+      }
+      : item));
+    setError("");
+  }
+
   async function removePhoto(index: number) {
     const removed = photos[index];
     if (!removed) return;
-    if (saveOutcomeUncertain && (removed.uploadPath || removed.cardUploadPath)) {
+    const backgroundPaths = (removed.backgroundOptions || []).flatMap((background) => [background.uploadPath, background.cardUploadPath]);
+    if (saveOutcomeUncertain && (removed.uploadPath || removed.cardUploadPath || backgroundPaths.some(Boolean))) {
       setError("This upload may already be referenced by a save without a confirmed response. Check the product record or retry the save before removing this image.");
       return;
     }
-    const uploadedPaths = [removed.uploadPath, removed.cardUploadPath].filter((path): path is string => Boolean(path));
+    const uploadedPaths = [removed.uploadPath, removed.cardUploadPath, ...backgroundPaths].filter((path): path is string => Boolean(path));
     if (uploadedPaths.length) {
       const { error: removeError } = await getSupabaseBrowserClient().storage.from("product-images").remove(uploadedPaths);
       if (removeError) {
@@ -556,8 +656,12 @@ export default function ProductEditorPage() {
       for (const path of uploadedPaths) uploadedPathsRef.current.delete(path);
     }
     if (removed.url.startsWith("blob:")) URL.revokeObjectURL(removed.url);
+    for (const background of removed.backgroundOptions || []) {
+      if (background.url.startsWith("blob:")) URL.revokeObjectURL(background.url);
+    }
     setPhotos((items) => items.filter((photo) => photo.id !== removed.id));
     if (cropPhotoId === removed.id) setCropPhotoId(null);
+    if (backgroundEditorPhotoId === removed.id) setBackgroundEditorPhotoId(null);
     setError("");
   }
 
@@ -610,9 +714,9 @@ export default function ProductEditorPage() {
     const { data: { user }, error: authError } = await db.auth.getUser();
     if (authError) throw new Error(`Could not verify the administrator sign-in. ${describeImageUploadError(authError)}`);
     if (!user) throw new Error("Your administrator sign-in is missing or expired. Sign in again, then retry; the form and selected images are kept.");
-    const filePhotos = photos.filter((photo) => photo.file);
+    const workPhotos = photos.filter((photo) => photo.file || photo.selectedBackgroundId || photo.cardBackgroundId || (photo.backgroundOptions || []).some((background) => background.file));
     const output: Photo[] = [];
-    setUploadProgress({ complete: 0, total: filePhotos.length, current: "" });
+    setUploadProgress({ complete: 0, total: workPhotos.length, current: "" });
     let complete = 0;
 
     async function uploadAsset(path: string, file: File): Promise<string> {
@@ -636,61 +740,134 @@ export default function ProductEditorPage() {
     }
 
     for (const photo of photos) {
-      const selectedFile = photo.file;
-      if (!selectedFile) { output.push(photo); continue; }
-      if (photo.uploadedUrl && photo.cardUploadedUrl) {
-        output.push({ ...photo, url: photo.uploadedUrl, cardUrl: photo.cardUploadedUrl, file: undefined });
-        complete += 1;
-        setUploadProgress({ complete, total: filePhotos.length, current: "" });
+      const backgroundOptions = [...(photo.backgroundOptions || [])];
+      let currentFile = photo.file;
+      let originalUrl = photo.uploadedUrl || photo.url;
+      let cardUrl = photo.cardUploadedUrl || photo.cardUrl;
+      const needsCard = currentFile
+        ? !(photo.uploadedUrl && photo.cardUploadedUrl && photo.cardBackgroundId === photo.selectedBackgroundId)
+        : Boolean(photo.cardBackgroundId !== photo.selectedBackgroundId && (photo.cardBackgroundId || photo.selectedBackgroundId));
+      const hasWork = Boolean(currentFile || needsCard || backgroundOptions.some((background) => background.file));
+      if (!hasWork) {
+        output.push({ ...photo, backgroundOptions });
         continue;
       }
-      setUploadProgress({ complete, total: filePhotos.length, current: selectedFile.name });
-      let failureStage = "Generating product-card image";
+      setUploadProgress({ complete, total: workPhotos.length, current: backgroundOptions.find((background) => background.file)?.file?.name || photo.file?.name || photo.alt || "Product image" });
+      let failureStage = "Preparing background options";
       try {
-        const prepared = await prepareProductImages(selectedFile, {
-          x: photo.cropX ?? 0.5,
-          y: photo.cropY ?? 0.5,
-          zoom: photo.cropZoom ?? 1,
-          mode: photo.cropMode ?? "contain",
-        });
-        const originalExtension = prepared.original.name.split(".").pop()?.toLowerCase() || "webp";
-        const cardExtension = prepared.card.name.split(".").pop()?.toLowerCase() || "webp";
-        const originalPath = photo.uploadPath || `${user.id}/${photo.id}-original.${originalExtension}`;
-        const cardPath = photo.cardUploadPath || `${user.id}/${photo.id}${PRODUCT_CARD_IMAGE_SUFFIX}.${cardExtension}`;
-        let originalUrl = photo.uploadedUrl;
-        if (!originalUrl) {
-          failureStage = "Uploading original image";
+        for (let index = 0; index < backgroundOptions.length; index += 1) {
+          const background = backgroundOptions[index];
+          if (!background.file || !background.cardFile) continue;
+          const originalExtension = background.file.name.split(".").pop()?.toLowerCase() || "webp";
+          const cardExtension = background.cardFile.name.split(".").pop()?.toLowerCase() || "webp";
+          const originalPath = background.uploadPath || `${user.id}/${photo.id}-background-${background.id}.${originalExtension}`;
+          const backgroundCardPath = background.cardUploadPath || `${user.id}/${photo.id}-background-${background.id}${PRODUCT_CARD_IMAGE_SUFFIX}.${cardExtension}`;
+          let backgroundUrl = background.uploadedUrl;
+          let backgroundCardUrl = background.cardUploadedUrl;
+          if (!backgroundUrl) {
+            failureStage = "Uploading background image";
+            setPhotos((current) => current.map((item) => item.id === photo.id ? {
+              ...item,
+              backgroundOptions: (item.backgroundOptions || []).map((option) => option.id === background.id ? { ...option, uploadPath: originalPath } : option),
+            } : item));
+            backgroundUrl = await uploadAsset(originalPath, background.file);
+          }
+          if (!backgroundCardUrl) {
+            failureStage = "Uploading 4:3 background preview";
+            setPhotos((current) => current.map((item) => item.id === photo.id ? {
+              ...item,
+              backgroundOptions: (item.backgroundOptions || []).map((option) => option.id === background.id
+                ? { ...option, uploadPath: originalPath, uploadedUrl: backgroundUrl, cardUploadPath: backgroundCardPath }
+                : option),
+            } : item));
+            backgroundCardUrl = await uploadAsset(backgroundCardPath, background.cardFile);
+          }
+          backgroundOptions[index] = {
+            ...background,
+            uploadPath: originalPath,
+            uploadedUrl: backgroundUrl,
+            cardUploadPath: backgroundCardPath,
+            cardUploadedUrl: backgroundCardUrl,
+          };
           setPhotos((current) => current.map((item) => item.id === photo.id
-            ? { ...item, uploadPath: originalPath, uploadStatus: "uploading", uploadError: undefined }
-            : item));
-          originalUrl = await uploadAsset(originalPath, prepared.original);
-          setPhotos((current) => current.map((item) => item.id === photo.id
-            ? { ...item, uploadPath: originalPath, uploadedUrl: originalUrl, uploadStatus: "uploading" }
+            ? { ...item, backgroundOptions: backgroundOptions.map((option) => ({ ...option })) }
             : item));
         }
 
-        let cardUrl = photo.cardUploadedUrl;
-        if (!cardUrl) {
-          failureStage = "Uploading card rendition";
+        const currentBackground = backgroundOptions.find((background) => background.id === photo.selectedBackgroundId);
+        if (needsCard) {
+          if (!currentFile) currentFile = await readPublicImageFile(photo.url, `${photo.id}-product-image`);
+          let backgroundFile: File | undefined;
+          if (currentBackground) {
+            if (currentBackground.cardFile) backgroundFile = currentBackground.cardFile;
+            else if (currentBackground.cardUrl || currentBackground.url) {
+              backgroundFile = await readPublicImageFile(currentBackground.cardUrl || currentBackground.url, `${currentBackground.id}-background-card`);
+            }
+          }
+          const prepared = await prepareProductImages(currentFile, currentBackground
+            ? { x: 0.5, y: 0.5, zoom: 1, mode: "contain" }
+            : {
+              x: photo.cropX ?? 0.5,
+              y: photo.cropY ?? 0.5,
+              zoom: photo.cropZoom ?? 1,
+              mode: photo.cropMode ?? "contain",
+            }, backgroundFile);
+          if (photo.file) {
+            const originalExtension = prepared.original.name.split(".").pop()?.toLowerCase() || "webp";
+            const originalPath = photo.uploadPath || `${user.id}/${photo.id}-original.${originalExtension}`;
+            if (!photo.uploadedUrl) {
+              failureStage = "Uploading original image";
+              setPhotos((current) => current.map((item) => item.id === photo.id
+                ? { ...item, uploadPath: originalPath, uploadStatus: "uploading", uploadError: undefined }
+                : item));
+              originalUrl = await uploadAsset(originalPath, prepared.original);
+            }
+          }
+
+          const cardExtension = prepared.card.name.split(".").pop()?.toLowerCase() || "webp";
+          const canReuseCard = photo.cardUploadedUrl && photo.cardBackgroundId === photo.selectedBackgroundId;
+          const cardPath = canReuseCard && photo.cardUploadPath
+            ? photo.cardUploadPath
+            : `${user.id}/${photo.id}${currentBackground ? `-bg-${currentBackground.id}` : ""}${PRODUCT_CARD_IMAGE_SUFFIX}.${cardExtension}`;
+          if (!canReuseCard) {
+            failureStage = "Uploading card rendition";
+            setPhotos((current) => current.map((item) => item.id === photo.id
+              ? { ...item, uploadPath: item.file ? (item.uploadPath || `${user.id}/${item.id}-original.${prepared.original.name.split(".").pop()?.toLowerCase() || "webp"}`) : item.uploadPath, uploadedUrl: item.uploadedUrl || (item.file ? originalUrl : undefined), cardUploadPath: cardPath, uploadStatus: "uploading", uploadError: undefined }
+              : item));
+            cardUrl = await uploadAsset(cardPath, prepared.card);
+          }
+          const originalExtension = photo.file ? prepared.original.name.split(".").pop()?.toLowerCase() || "webp" : undefined;
+          const originalPath = photo.file ? photo.uploadPath || `${user.id}/${photo.id}-original.${originalExtension}` : undefined;
+          output.push({
+            ...photo,
+            url: originalUrl,
+            file: undefined,
+            uploadPath: originalPath,
+            uploadedUrl: photo.file ? originalUrl : undefined,
+            cardUrl,
+            cardUploadPath: cardPath,
+            cardUploadedUrl: cardUrl,
+            cardBackgroundId: photo.selectedBackgroundId,
+            backgroundOptions,
+            uploadStatus: "uploaded",
+            uploadError: undefined,
+          });
           setPhotos((current) => current.map((item) => item.id === photo.id
-            ? { ...item, uploadPath: originalPath, uploadedUrl: originalUrl, cardUploadPath: cardPath, uploadStatus: "uploading", uploadError: undefined }
+            ? { ...item, uploadPath: originalPath, uploadedUrl: photo.file ? originalUrl : undefined, cardUploadPath: cardPath, cardUploadedUrl: cardUrl, cardBackgroundId: photo.selectedBackgroundId, backgroundOptions: backgroundOptions.map((option) => ({ ...option })), uploadStatus: "uploaded", uploadError: undefined }
             : item));
-          cardUrl = await uploadAsset(cardPath, prepared.card);
+        } else {
+          output.push({ ...photo, backgroundOptions });
         }
-        output.push({ ...photo, url: originalUrl, file: undefined, uploadPath: originalPath, uploadedUrl: originalUrl, cardUrl, cardUploadPath: cardPath, cardUploadedUrl: cardUrl, uploadStatus: "uploaded", uploadError: undefined });
-        setPhotos((current) => current.map((item) => item.id === photo.id
-          ? { ...item, uploadPath: originalPath, uploadedUrl: originalUrl, cardUrl, cardUploadPath: cardPath, cardUploadedUrl: cardUrl, uploadStatus: "uploaded", uploadError: undefined }
-          : item));
         complete += 1;
-        setUploadProgress({ complete, total: filePhotos.length, current: "" });
+        setUploadProgress({ complete, total: workPhotos.length, current: "" });
       } catch (caught) {
-        const stage = caught instanceof ProductImageFileError ? "Reading selected image" : failureStage;
+        const stage = caught instanceof ProductImageFileError ? "Reading selected image or background" : failureStage;
         const detail = stage.startsWith("Uploading") ? describeImageUploadError(caught) : safeError(caught);
         const reason = `${stage} failed. ${detail}`;
         setPhotos((current) => current.map((item) => item.id === photo.id
           ? { ...item, uploadStatus: "failed", uploadError: reason }
           : item));
-        throw new Error(`Image “${selectedFile.name}”: ${reason} Use the retry button to continue without losing the product form or other selected images.`);
+        throw new Error(`Image “${photo.file?.name || photo.alt || "product photo"}”: ${reason} Use the retry button to continue without losing the product form, photos or background choices.`);
       }
     }
     return { photos: output };
@@ -784,8 +961,20 @@ export default function ProductEditorPage() {
         source_image_urls: uploaded.photos.flatMap((photo) => {
           const sourceUrl = photo.sourceUrl && photo.sourceUrl !== photo.url ? photo.sourceUrl : undefined;
           const cardImageUrl = photo.cardUrl && photo.cardUrl !== photo.url ? photo.cardUrl : undefined;
-          return sourceUrl || cardImageUrl
-            ? [{ image_url: photo.url, ...(sourceUrl ? { source_url: sourceUrl } : {}), ...(cardImageUrl ? { card_image_url: cardImageUrl } : {}) }]
+          const backgroundOptions = (photo.backgroundOptions || []).map((background) => {
+            const imageUrl = background.uploadedUrl || background.url;
+            const cardUrl = background.cardUploadedUrl || background.cardUrl;
+            return { image_url: imageUrl, ...(cardUrl ? { card_image_url: cardUrl } : {}) };
+          });
+          const selectedBackgroundUrl = (photo.backgroundOptions || []).find((background) => background.id === photo.selectedBackgroundId);
+          return sourceUrl || cardImageUrl || backgroundOptions.length
+            ? [{
+              image_url: photo.url,
+              ...(sourceUrl ? { source_url: sourceUrl } : {}),
+              ...(cardImageUrl ? { card_image_url: cardImageUrl } : {}),
+              ...(backgroundOptions.length ? { background_options: backgroundOptions } : {}),
+              ...(selectedBackgroundUrl ? { selected_background_url: selectedBackgroundUrl.uploadedUrl || selectedBackgroundUrl.url } : {}),
+            }]
             : [];
         }),
         status: chosenStatus,
@@ -836,20 +1025,37 @@ export default function ProductEditorPage() {
       uploadedPathsRef.current.clear();
       for (const photo of photosRef.current) {
         if (photo.url.startsWith("blob:")) URL.revokeObjectURL(photo.url);
+        for (const background of photo.backgroundOptions || []) {
+          if (background.url.startsWith("blob:")) URL.revokeObjectURL(background.url);
+        }
       }
       const savedPhotos = uploaded.photos.map((photo) => ({
         ...photo,
+        url: photo.uploadedUrl || photo.url,
+        cardUrl: photo.cardUploadedUrl || photo.cardUrl,
         file: undefined,
         uploadPath: undefined,
         uploadedUrl: undefined,
         cardUploadPath: undefined,
         cardUploadedUrl: undefined,
+        backgroundOptions: (photo.backgroundOptions || []).map((background) => ({
+          ...background,
+          url: background.uploadedUrl || background.url,
+          cardUrl: background.cardUploadedUrl || background.cardUrl,
+          file: undefined,
+          cardFile: undefined,
+          uploadPath: undefined,
+          uploadedUrl: undefined,
+          cardUploadPath: undefined,
+          cardUploadedUrl: undefined,
+        })),
         uploadStatus: undefined,
         uploadError: undefined,
       }));
       photosRef.current = savedPhotos;
       setPhotos(savedPhotos);
       setCropPhotoId(null);
+      setBackgroundEditorPhotoId(null);
       setRetryAction(null);
       setSaveOutcomeUncertain(false);
       setSuccess((chosenStatus === "published" ? "Product saved and marked published in the shared catalogue." : chosenStatus === "draft" ? "Product saved as a draft in the shared catalogue." : `Product changes saved. Current status: ${chosenStatus}.`) + historyWarning);
@@ -870,9 +1076,31 @@ export default function ProductEditorPage() {
             setError(`Save failed; temporary image cleanup needs attention. ${describeImageUploadError(cleanupError)} ${safeError(caught)}`);
           } else {
             uploadedPathsRef.current.clear();
-            setPhotos((current) => current.map((photo) => uploadedPaths.includes(photo.uploadPath || "") || uploadedPaths.includes(photo.cardUploadPath || "")
-              ? { ...photo, uploadPath: undefined, uploadedUrl: undefined, cardUploadPath: undefined, cardUploadedUrl: undefined, uploadStatus: undefined, uploadError: undefined }
-              : photo));
+            setPhotos((current) => current.map((photo) => {
+              const originalRemoved = uploadedPaths.includes(photo.uploadPath || "");
+              const cardRemoved = uploadedPaths.includes(photo.cardUploadPath || "");
+              const backgroundOptions = (photo.backgroundOptions || []).map((background) => {
+                const backgroundOriginalRemoved = uploadedPaths.includes(background.uploadPath || "");
+                const backgroundCardRemoved = uploadedPaths.includes(background.cardUploadPath || "");
+                return {
+                  ...background,
+                  ...(backgroundOriginalRemoved ? { uploadPath: undefined, uploadedUrl: undefined } : {}),
+                  ...(backgroundCardRemoved ? { cardUploadPath: undefined, cardUploadedUrl: undefined } : {}),
+                };
+              });
+              const backgroundRemoved = backgroundOptions.some((background, index) =>
+                uploadedPaths.includes(photo.backgroundOptions?.[index]?.uploadPath || "") || uploadedPaths.includes(photo.backgroundOptions?.[index]?.cardUploadPath || ""));
+              return originalRemoved || cardRemoved || backgroundRemoved
+                ? {
+                  ...photo,
+                  ...(originalRemoved ? { uploadPath: undefined, uploadedUrl: undefined } : {}),
+                  ...(cardRemoved ? { cardUploadPath: undefined, cardUploadedUrl: undefined, cardBackgroundId: undefined } : {}),
+                  backgroundOptions,
+                  uploadStatus: undefined,
+                  uploadError: undefined,
+                }
+                : photo;
+            }));
             setError(`Save failed; no catalogue change was confirmed. Temporary uploads were removed, and the selected images and product details are still in the form. ${safeError(caught)}`);
           }
         } else {
@@ -942,9 +1170,20 @@ export default function ProductEditorPage() {
                 {photo.file && <span role="status" style={{ position: "absolute", left: 4, right: 4, top: 23, padding: "3px 5px", background: photo.uploadStatus === "failed" ? "#8d2d36e8" : photo.uploadStatus === "uploaded" ? "#17694de8" : "#080b12d9", borderRadius: 5, color: "#fff", fontSize: 9, textAlign: "center" }}>{photo.cropAnalysisState === "analysing" ? "Reviewing locally…" : photo.uploadStatus === "uploading" ? "Preparing / uploading…" : photo.uploadStatus === "uploaded" ? "Uploaded · ready to save" : photo.uploadStatus === "failed" ? "Failed · retry available" : photo.cropConfidence === "high" ? "Clear visual estimate · review" : "Crop review needed"}</span>}
                 {photo.sourceUrl && <a href={photo.sourceUrl} target="_blank" rel="noreferrer" title={photo.sourceUrl} aria-label={`Open original image source for photo ${index + 1}`} style={{ position: "absolute", left: 4, bottom: 38, padding: "3px 5px", background: "#080b12d9", borderRadius: 5, color: "#d7e5ff", fontSize: 9 }}>SOURCE</a>}
                 {photo.file && <button type="button" className="photo-crop-action" onClick={() => setCropPhotoId((current) => current === photo.id ? null : photo.id)} aria-label={`Adjust 4:3 crop for ${photo.file.name}`} aria-pressed={cropPhotoId === photo.id} title="Adjust 4:3 crop" disabled={saving}><Crop size={12}/></button>}
-                <div className="photo-actions"><button type="button" onClick={() => movePhoto(index, -1)} aria-label="Move photo up" disabled={saving}><ArrowUp size={12}/></button><button type="button" onClick={() => movePhoto(index, 1)} aria-label="Move photo down" disabled={saving}><ArrowDown size={12}/></button><button type="button" onClick={() => void removePhoto(index)} aria-label="Remove photo" disabled={saving || (saveOutcomeUncertain && Boolean(photo.uploadPath || photo.cardUploadPath))}><Trash2 size={12}/></button></div>
+                <button type="button" className="photo-background-action" onClick={() => setBackgroundEditorPhotoId((current) => current === photo.id ? null : photo.id)} aria-label={`Choose backgrounds for image ${index + 1}`} aria-pressed={backgroundEditorPhotoId === photo.id} title={`Backgrounds · ${photo.backgroundOptions?.length || 0}/${MAX_PRODUCT_BACKGROUND_OPTIONS}`} disabled={saving || processingImages}><ImagePlus size={12}/></button>
+                <div className="photo-actions"><button type="button" onClick={() => movePhoto(index, -1)} aria-label="Move photo up" disabled={saving}><ArrowUp size={12}/></button><button type="button" onClick={() => movePhoto(index, 1)} aria-label="Move photo down" disabled={saving}><ArrowDown size={12}/></button><button type="button" onClick={() => void removePhoto(index)} aria-label="Remove photo" disabled={saving || (saveOutcomeUncertain && Boolean(photo.uploadPath || photo.cardUploadPath || (photo.backgroundOptions || []).some((background) => background.uploadPath || background.cardUploadPath)))}><Trash2 size={12}/></button></div>
               </div>)}
             </div>
+            {backgroundEditorPhoto && <ProductBackgroundEditor
+              photoUrl={backgroundEditorPhoto.url}
+              photoAlt={`Image ${photos.findIndex((photo) => photo.id === backgroundEditorPhoto.id) + 1}`}
+              backgrounds={backgroundEditorPhoto.backgroundOptions || []}
+              selectedBackgroundId={backgroundEditorPhoto.selectedBackgroundId}
+              disabled={saving || processingImages || saveOutcomeUncertain}
+              onAdd={(file) => void addBackground(backgroundEditorPhoto.id, file)}
+              onSelect={(backgroundId) => selectBackground(backgroundEditorPhoto.id, backgroundId)}
+              onRemove={(backgroundId) => void removeBackground(backgroundEditorPhoto.id, backgroundId)}
+            />}
             {cropPhoto && <div className="image-crop-editor">
               <div className="image-crop-previews">
                 <div className="image-crop-preview-cell">
@@ -996,7 +1235,7 @@ export default function ProductEditorPage() {
               </div>
             </div>}
             {photos.filter((photo) => photo.uploadError).map((photo) => <p key={`${photo.id}-error`} role="alert" className="field-note" style={{ color: "#ffb1b1", marginTop: 8 }}>{photo.file?.name}: {photo.uploadError}</p>)}
-            {uploadProgress.total > 0 && <div role="status" className="helper" style={{ marginTop: 10 }}><LoaderCircle size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />Uploading image {uploadProgress.complete + 1} of {uploadProgress.total}{uploadProgress.current ? `: ${uploadProgress.current}` : ""}…</div>}
+            {uploadProgress.total > 0 && <div role="status" className="helper" style={{ marginTop: 10 }}><LoaderCircle size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />Preparing or uploading product image/background {uploadProgress.complete + 1} of {uploadProgress.total}{uploadProgress.current ? `: ${uploadProgress.current}` : ""}…</div>}
             {!saving && retryAction && saveOutcomeUncertain && <button className="button ghost" type="button" style={{ marginTop: 10 }} onClick={() => void save(retryAction)}><Save size={14}/>Retry save with retained images</button>}
             {!saving && retryAction && photos.some((photo) => photo.uploadStatus === "failed") && <button className="button ghost" type="button" style={{ marginTop: 10 }} onClick={() => void save(retryAction)}><ImagePlus size={14}/>Retry failed image stages</button>}
           </section>
@@ -1080,7 +1319,7 @@ export default function ProductEditorPage() {
             <button className="button" type="submit" disabled={saving || processingImages || !SUPABASE_CONFIGURED}><Save size={15}/>{saving ? "Saving…" : processingImages ? "Checking images…" : "Save draft"}</button>
             <button className="button ghost" type="button" disabled={saving || processingImages || !SUPABASE_CONFIGURED} onClick={() => void save("current")}>{saving ? "Saving…" : processingImages ? "Checking images…" : "Save changes"}</button>
             <button className="button primary" type="button" disabled={saving || processingImages || !SUPABASE_CONFIGURED} onClick={() => void save("published")}><Check size={15}/>{saving ? "Publishing…" : processingImages ? "Checking images…" : "Publish product"}</button>
-            {saving && <div className="helper" style={{ textAlign: "center" }}><LoaderCircle size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />{uploadProgress.total > 0 ? `Uploading images ${uploadProgress.complete}/${uploadProgress.total}…` : "Wait for database confirmation."}</div>}
+            {saving && <div className="helper" style={{ textAlign: "center" }}><LoaderCircle size={13} style={{ verticalAlign: "middle", marginRight: 5 }} />{uploadProgress.total > 0 ? `Preparing or uploading product images/backgrounds ${uploadProgress.complete}/${uploadProgress.total}…` : "Wait for database confirmation."}</div>}
           </div>
         </aside>
       </div>
